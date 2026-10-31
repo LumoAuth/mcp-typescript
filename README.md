@@ -121,10 +121,7 @@ These packages do not proxy OAuth flows or issue tokens. They give your server t
 
 ## Development
 
-`overrides` in this workspace's `package.json` link `@lumoauth/agent` and `@lumoauth/shared` to the sibling `../sdk-js` checkout, so build those two packages first. Without the checkout or its `dist` folders, `npm install` still succeeds, and `npm run build` then fails with `Cannot find module '@lumoauth/agent'`.
-
 ```bash
-(cd ../sdk-js && npm ci && npm run build -w packages/shared -w packages/agent)
 npm install
 npm run build
 npm test
