@@ -1,6 +1,6 @@
 {
     "name": "@lumoauth/mcp",
-    "version": "0.1.0",
+    "version": "1.0.0",
     "description": "LumoAuth authentication and authorization for MCP servers built with the official TypeScript MCP SDK (v1 and v2): RFC 9728 discovery, Bearer and DPoP token verification, per-tool policy.",
     "license": "MIT",
     "author": "LumoAuth",
