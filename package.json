@@ -13,10 +13,6 @@
         "typecheck": "npm run typecheck --workspaces --if-present",
         "test": "npm run test --workspaces --if-present"
     },
-    "overrides": {
-        "@lumoauth/shared": "file:../sdk-js/packages/shared",
-        "@lumoauth/agent": "file:../sdk-js/packages/agent"
-    },
     "engines": {
         "node": ">=20.0.0"
     }
