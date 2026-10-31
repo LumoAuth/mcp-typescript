@@ -1,0 +1,55 @@
+{
+    "name": "lumoauth",
+    "version": "0.1.0",
+    "description": "`npx lumoauth secure`: put LumoAuth sign-in and per-tool authorization in front of an existing MCP server, without changing its code.",
+    "license": "MIT",
+    "author": "LumoAuth",
+    "publishConfig": {
+        "access": "public",
+        "provenance": true
+    },
+    "bin": {
+        "lumoauth": "dist/cli.js"
+    },
+    "files": [
+        "dist",
+        "README.md"
+    ],
+    "scripts": {
+        "build": "tsup",
+        "typecheck": "tsc --noEmit",
+        "prepublishOnly": "npm run build",
+        "test": "npm run build && node --test tests/*.test.mjs"
+    },
+    "keywords": [
+        "lumoauth",
+        "mcp",
+        "model-context-protocol",
+        "oauth",
+        "proxy",
+        "gateway"
+    ],
+    "dependencies": {
+        "@lumoauth/mcp": "^0.1.0",
+        "@modelcontextprotocol/sdk": "^1.32.2"
+    },
+    "devDependencies": {
+        "@types/node": "^20.19.43",
+        "tsup": "^8.0.0",
+        "typescript": "^5.5.0",
+        "@lumoauth/agent": "^1.2.0"
+    },
+    "engines": {
+        "node": ">=20.0.0"
+    },
+    "main": "dist/index.js",
+    "module": "dist/index.mjs",
+    "types": "dist/index.d.ts",
+    "exports": {
+        ".": {
+            "types": "./dist/index.d.ts",
+            "import": "./dist/index.mjs",
+            "require": "./dist/index.js"
+        }
+    }
+}
