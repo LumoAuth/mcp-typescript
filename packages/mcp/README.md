@@ -1,59 +1,66 @@
+<div align="center">
+
+<a href="https://lumoauth.dev">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://docs.lumoauth.dev/img/lumoauth-logo-horizontal-reversed.svg">
+    <img src="https://docs.lumoauth.dev/img/lumoauth-logo-horizontal.svg" alt="LumoAuth" height="36">
+  </picture>
+</a>
+
 # @lumoauth/mcp
 
-LumoAuth sign-in and authorization for MCP servers built with the official
-TypeScript SDK: `@modelcontextprotocol/sdk` (v1) and
-`@modelcontextprotocol/server` (v2).
+**Add sign-in and per-tool access control to an MCP server built with the official TypeScript SDK.**
+
+[![@lumoauth/mcp on npm](https://img.shields.io/badge/npm-%40lumoauth%2Fmcp-111)](https://www.npmjs.com/package/@lumoauth/mcp)
+[![Node 20+](https://img.shields.io/badge/node-20%2B-111)](#requirements)
+[![MCP SDK v1 and v2](https://img.shields.io/badge/mcp%20sdk-v1%20%C2%B7%20v2-111)](#other-setups)
+[![License: MIT](https://img.shields.io/badge/license-MIT-111)](#license)
+
+[Quick start](#quick-start) · [Other setups](#other-setups) · [Who is calling](#who-is-calling) · [Per-tool authorization](#per-tool-authorization) · [Troubleshooting](#troubleshooting) · [Docs](https://docs.lumoauth.dev/mcp/)
+
+</div>
+
+---
 
 ```ts
 import { lumoAuth } from '@lumoauth/mcp';
 
-const auth = lumoAuth();                    // LUMOAUTH_ORG_ID + LUMOAUTH_MCP_SERVER_ID
-app.use(auth.router());                     // OAuth discovery for MCP clients
+const auth = lumoAuth();                    // reads LUMOAUTH_ORG_ID and LUMOAUTH_MCP_SERVER_ID
+app.use(auth.router());                     // discovery for MCP clients
 app.post('/mcp', auth.protect(), mcp);      // 401 challenge, token check, req.auth
 ```
 
-Claude, ChatGPT, VS Code, Cursor and every other MCP client that follows
-the MCP authorization specification can then sign users in through
-LumoAuth and call the server with a token issued for it.
+[LumoAuth](https://lumoauth.dev) signs users in and issues the tokens. Your server checks each token and runs the tool. It works with `@modelcontextprotocol/sdk` (v1) and `@modelcontextprotocol/server` (v2).
 
-## What it does
+No access to the server's code, or not a TypeScript server? [`npx lumoauth secure`](https://www.npmjs.com/package/lumoauth) puts the same checks in front of any MCP server.
 
-LumoAuth is the authorization server: it registers MCP clients, shows the
-consent screen and issues tokens whose audience is your server's Resource
-URI. Your server stays a resource server, and this package gives it what
-the MCP specification asks of one:
+## Quick start
 
-- `router()` serves the protected resource metadata (RFC 9728) at
-  `/.well-known/oauth-protected-resource/...`, naming your LumoAuth
-  organization as the authorization server. For older clients it also
-  mirrors LumoAuth's metadata at `/.well-known/oauth-authorization-server`.
-- `protect()` answers `401` with a `WWW-Authenticate` challenge that points
-  at that document, or verifies the token: signature against the
-  organization's keys, issuer, audience, expiry, `at+jwt` type, and no
-  portal test tokens. A DPoP-bound token must come with the `DPoP` scheme
-  and a fresh proof. A refusal states its real reason.
-- The verified caller lands on `req.auth`, which the SDK passes to tools.
+You need Node 20 or later and a LumoAuth organization. [Create an organization](https://app.lumoauth.dev/register) if you do not have one yet.
 
-On the first request, the package reads the server's registration from
-LumoAuth: the Resource URI, the advertised scopes and the **Require DPoP**
-switch. Call `await auth.ready()` at start-up to read it sooner and to fail
-fast on a wrong server id. Restart the server after you change the
-registration.
+### 1. Register your server
 
-## Setup
+In the LumoAuth portal:
 
-1. Register the server in the LumoAuth portal under **AI Agents → MCP
-   servers**. The **Resource URI** is the URL that clients connect to. For
-   local development, register a second server with
-   `http://localhost:3000/mcp`.
-2. `npm install @lumoauth/mcp`
-3. Set `LUMOAUTH_ORG_ID` and `LUMOAUTH_MCP_SERVER_ID` (the `mcp_…` id on the
-   server's page). For the EU region, set
-   `LUMOAUTH_URL=https://eu.app.lumoauth.dev`.
+1. Open **AI Agents → MCP servers** and click **Register MCP server**.
+2. Set **Server name** to `Invoices` and **Resource URI** to `http://localhost:3000/mcp`.
+3. Click **Next** twice, then click **Register MCP server**.
+4. On the server's page, click **Edit**, then **Next**. Make two changes:
+   - Under **Scopes**, click **Use defaults**.
+   - Switch off **Require DPoP sender-constrained tokens**. Claude Code does not send DPoP proofs, so it cannot connect while this switch is on.
+5. Click **Next**, then **Save changes**. Copy the **Server id** (`mcp_…`) from the top of the page.
 
-### SDK v1 with Express
+The **Resource URI** is the exact URL that clients connect to. A token for one Resource URI does not work at another.
 
-```ts
+### 2. Run the server
+
+```bash
+npm install @lumoauth/mcp @modelcontextprotocol/sdk express
+```
+
+Save this as `server.mjs`. It is plain JavaScript, so it runs without a build step. In TypeScript, write `getCaller(extra)!`.
+
+```js
 import express from 'express';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -64,10 +71,9 @@ await auth.ready();
 
 function buildServer() {
     const server = new McpServer({ name: 'invoices', version: '1.0.0' });
-    server.registerTool('whoami', { description: 'Who is calling' }, async (extra) => {
-        const caller = getCaller(extra)!;   // set, because auth.protect() ran first
-        return { content: [{ type: 'text', text: caller.isAgent ? `agent ${caller.agentId}` : `user ${caller.sub}` }] };
-    });
+    server.registerTool('whoami', { description: 'Show who is calling' }, async (extra) => ({
+        content: [{ type: 'text', text: getCaller(extra).sub }],
+    }));
     return server;
 }
 
@@ -84,9 +90,86 @@ app.post('/mcp', auth.protect(), async (req, res) => {
 app.listen(3000);
 ```
 
-### SDK v2
+Start it with your organization's slug and the server id from step 1. The slug is the part after `/orgs/` in the portal's URL.
 
-With a `fetch` handler (Cloudflare-style, Hono, Bun, Deno):
+```bash
+export LUMOAUTH_ORG_ID=acme
+export LUMOAUTH_MCP_SERVER_ID=mcp_0123456789abcdef01234567
+node server.mjs
+```
+
+For the EU region, also set `LUMOAUTH_URL=https://eu.app.lumoauth.dev`.
+
+### 3. Call it without a token
+
+```console
+$ curl -i -X POST http://localhost:3000/mcp
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Bearer scope="mcp:read", resource_metadata="http://localhost:3000/.well-known/oauth-protected-resource/mcp"
+```
+
+Your server now rejects calls without a token. The `401` tells MCP clients where to find LumoAuth.
+
+### 4. Sign in from a client
+
+First, create an application for the client in the portal:
+
+1. Open **Applications**, click **New application** and choose **Single-page or mobile app**.
+2. Set **Application name** to `Local MCP client` and **Redirect URI** to `http://localhost:8765/callback`.
+3. Click **Create application** and copy the **Client ID**.
+4. On the **Configuration** tab, set **Scopes** to `openid profile email offline_access mcp:read`. Click **Save configuration**.
+
+Then connect Claude Code, with your client ID:
+
+```bash
+claude mcp add --transport http \
+  --client-id client_0123456789abcdef0123456789abcdef \
+  --callback-port 8765 \
+  invoices http://localhost:3000/mcp
+
+claude mcp login invoices
+```
+
+Your browser opens on the LumoAuth sign-in page. After you sign in and approve, `claude mcp list` shows the connection:
+
+```console
+invoices: http://localhost:3000/mcp (HTTP) - ✔ Connected
+```
+
+Ask Claude Code to call `whoami`, and the tool returns your LumoAuth user id from the verified token.
+
+Other MCP clients connect the same way if they let you set a client ID and a callback port. [Troubleshooting](#troubleshooting) explains the errors that you may see.
+
+### Before you go to production
+
+- Register a separate server with your public `https://` address. LumoAuth accepts plain `http://` only for `localhost`, `127.0.0.1` and `[::1]`.
+- Under **Allowed clients**, choose **Only the clients I pick**.
+- Switch on **Require DPoP sender-constrained tokens** if all your clients can send proofs. Agents built on the LumoAuth JavaScript, Python and Go SDKs can do so.
+
+## How it works
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/LumoAuth/mcp-typescript/main/assets/how-it-works-dark.svg">
+    <img src="https://raw.githubusercontent.com/LumoAuth/mcp-typescript/main/assets/how-it-works.svg" alt="An MCP client calls your server without a token and gets a 401 that says where to sign in. The user signs in through LumoAuth, which issues a token for this server only. The client calls the tool with the token. Your server checks the token and runs the tool." width="720">
+  </picture>
+</p>
+
+LumoAuth is the authorization server. It shows the consent screen and issues tokens whose audience is your server's Resource URI. Your server stays a resource server, and this package gives it what the MCP specification asks of one:
+
+- `router()` serves the protected resource metadata at `/.well-known/oauth-protected-resource/...`. This document names your LumoAuth organization as the authorization server. For older clients, `router()` also serves LumoAuth's metadata at `/.well-known/oauth-authorization-server`.
+- `protect()` answers `401` with a `WWW-Authenticate` challenge that points to that document, or it verifies the token. It checks the signature against the organization's keys, issuer, audience, expiry and `at+jwt` type, and it rejects portal test tokens. A DPoP-bound token must come with the `DPoP` scheme and a fresh proof. A rejection states its real reason.
+- `protect()` puts the verified caller on `req.auth`, which the SDK passes to tools.
+
+On the first request, the package reads the server's registration from LumoAuth: the Resource URI, the advertised scopes and the **Require DPoP** switch. Call `await auth.ready()` at start-up to read it sooner and to report a wrong server id at once. Restart the server after you change the registration.
+
+## Other setups
+
+The quick start uses SDK v1 with Express. SDK v2 works with a `fetch` handler or with Express.
+
+### SDK v2 with a `fetch` handler
+
+For Cloudflare-style handlers, Hono, Bun and Deno:
 
 ```ts
 import { McpServer, createMcpHandler } from '@modelcontextprotocol/server';
@@ -104,30 +187,27 @@ export async function fetchHandler(request: Request): Promise<Response> {
 }
 ```
 
-With Express, `toNodeHandler` from `@modelcontextprotocol/node` forwards
-`req.auth` to the handler:
+The token check uses `node:crypto` (through `@lumoauth/agent`), so it runs on Node 20+, Bun and Deno.
+
+### SDK v2 with Express
+
+`toNodeHandler` from `@modelcontextprotocol/node` forwards `req.auth` to the handler:
 
 ```ts
 app.use(auth.router());
 app.post('/mcp', auth.protect(), toNodeHandler(handler));
 ```
 
-`toNodeHandler` reads the request body itself, so a route behind
-`express.json()` answers `400 Parse error`. If the app needs that parser,
-pass the parsed body on:
+`toNodeHandler` reads the request body itself, so a route behind `express.json()` answers `400 Parse error`. If the app needs that parser, pass the parsed body on:
 
 ```ts
 const mcp = toNodeHandler(handler);
 app.post('/mcp', auth.protect(), (req, res) => mcp(req, res, req.body));
 ```
 
-The token check uses `node:crypto` (through `@lumoauth/agent`), so it runs
-on Node 20+, Bun and Deno.
-
 ## Who is calling
 
-`getCaller(extra)` (v1) or `getCaller(ctx)` (v2) returns the verified caller,
-or `undefined` for a request without auth info, as on stdio:
+`getCaller(extra)` (v1) or `getCaller(ctx)` (v2) returns the verified caller, or `undefined` for a request without auth info, as on stdio:
 
 | Field | Meaning |
 | --- | --- |
@@ -141,8 +221,7 @@ or `undefined` for a request without auth info, as on stdio:
 
 ## Per-tool authorization
 
-`auth.secureTools(server, options)` guards every tool that is registered
-after the call; `scopes` maps tool names to the scopes they need:
+`auth.secureTools(server, options)` guards every tool that is registered after the call. `scopes` maps tool names to the scopes that they need:
 
 ```ts
 const server = new McpServer({ name: 'invoices', version: '1.0.0' });
@@ -159,39 +238,36 @@ server.registerTool('change_bank_details', { inputSchema: { iban: z.string() } }
 
 The options:
 
-- `scopes`: the scopes the tool needs. As in LumoAuth, a granted scope that
-  ends in `:*` (such as `invoices:*`) covers the scopes under it, and every
-  other scope compares exactly. Prefer narrow scopes: the MCP security best
-  practices list wildcard scopes as a common mistake.
-- `agents: true` or `agents: ['billing.reminders']`: AI agents only, with
-  these capabilities.
-- `users: true`: people only. `users: 'delegated'` also admits an agent
-  that acts for a person.
-- `policy`: ask LumoAuth's per-tool policy (on by default when the server's
-  client credentials are set, see below).
-- `allowUnauthenticated: true`: run the tool on a request without auth info,
-  as on stdio. By default, such a call is refused.
+- `scopes`: the scopes that the tool needs. As in LumoAuth, a granted scope that ends in `:*` (such as `invoices:*`) covers the scopes under it, and every other scope compares exactly. Prefer narrow scopes, because the MCP security best practices list wildcard scopes as a common mistake.
+- `agents: true` or `agents: ['billing.reminders']`: AI agents only, with these capabilities.
+- `users: true`: people only. `users: 'delegated'` also admits an agent that acts for a person.
+- `policy`: ask LumoAuth's per-tool policy. This is on by default when the server's client credentials are set, as described below.
+- `allowUnauthenticated: true`: run the tool on a request without auth info, as on stdio. By default, such a call is rejected.
 
-A refused call becomes an error result that the model can read. With SDK
-v2, `scopeChallenge: auth.scopeChallenge('invoices:refund')` on
-`registerTool` turns a missing scope into a `403 insufficient_scope`
-step-up instead, so the client can ask the user for the scope.
+A rejected call becomes an error result that the model can read. With SDK v2, `scopeChallenge: auth.scopeChallenge('invoices:refund')` on `registerTool` turns a missing scope into a `403 insufficient_scope` step-up instead. The client can then ask the user for the scope.
+
+Add a new scope in two places: the server's **Scopes**, and the **Scopes** of each application that may ask for it.
 
 ### LumoAuth's per-tool policy
 
-Whether a user or agent may run a tool can be a policy that you manage in
-LumoAuth: roles, relationships, ABAC rules, agent capabilities. The server
-asks LumoAuth as itself and never forwards the caller's token, which the
-MCP specification forbids. Set it up once:
+With the policy on, the server asks LumoAuth about each tool. The server asks as itself and never forwards the caller's token, which the MCP specification forbids.
 
-1. Create an OAuth client for the MCP server with the `client_credentials`
-   grant and the `mcp:authorize` scope.
-2. Edit the server in the portal. In the step **Who may connect and how**,
-   select that client under **Per-tool authorization**.
-3. Set `LUMOAUTH_MCP_CLIENT_ID` and `LUMOAUTH_MCP_CLIENT_SECRET`.
+**Every tool is denied until you grant it.** Set it up once:
 
-Decisions are cached for 30 seconds (`toolDecisionTtl`). When LumoAuth
-cannot be reached, the tool is refused.
+1. **Create the server's own application.** Open **Applications**, click **New application** and choose **Machine to machine**. Copy the **Client ID** and the **Client secret**, which is shown only once.
+2. **Allow the scope.** On the application's **Configuration** tab, set **Scopes** to `mcp:authorize`. The form also asks for a redirect URI, which this application does not use, so enter any `https://` URL. Click **Save configuration**.
+3. **Connect it to the MCP server.** Edit the server. In the step **Who may connect and how**, select the application under **Per-tool authorization**.
+4. **Give the server its credentials.** Set `LUMOAUTH_MCP_CLIENT_ID` and `LUMOAUTH_MCP_CLIENT_SECRET`, then restart it.
+5. **Grant access.** Open **Relationships**. Under **Namespaces**, create the namespace that you need, with the relation `invoke`. Then, under **Tuples**, add one relationship for each grant:
+
+   | To grant | Object namespace | Object ID | Relation | Subject |
+   | --- | --- | --- | --- | --- |
+   | Every tool on the server | `mcp_server` | `mcp_0123456789abcdef01234567` | `invoke` | `user` and the user's id |
+   | One tool | `mcp_tool` | `mcp_0123456789abcdef01234567/refund` | `invoke` | `agent` and the agent's id |
+
+Relationships are part of the Fine-grained authorization add-on. Without it, every tool is denied.
+
+Decisions are cached for 30 seconds (`toolDecisionTtl`). When LumoAuth cannot be reached, the tool is rejected.
 
 ## Configuration
 
@@ -211,9 +287,26 @@ cannot be reached, the tool is refused.
 | `replayCache` | | in memory; share one between replicas (`add(key, ttl)` returns `false` for a replay) |
 | `authorizationServerMetadata` | | `true` |
 
+## Troubleshooting
+
+`npx lumoauth check` prints what the registration says, the discovery document and the `401` challenge.
+
+| What you see | Why | What to do |
+| --- | --- | --- |
+| `LumoAuth has no active MCP server` at start-up | The server id or the organization slug is wrong. | Copy both again from the portal. |
+| `404` from `curl` | The quick start's route accepts only `POST`. | Use `curl -i -X POST`. |
+| `Protected resource … does not match expected …` | The client connects to a URL that differs from the Resource URI. `localhost` and `127.0.0.1` count as different. | Use the Resource URI exactly. |
+| `invalid_dpop_proof` or `DPoP proof required` | **Require DPoP** is on and the client sends no proof. | Switch it off, then restart the server. |
+| `invalid_scope` … `not allowed for this client` | The application does not allow a scope that the client asks for. | Add the scope to the application's **Scopes**. Many clients add `offline_access` on their own. |
+| `Invalid Redirect URL` on a LumoAuth page | The client's redirect URI is not registered. LumoAuth accepts a changing port only on `127.0.0.1` and `[::1]`, not on `localhost`. | Create an application with the exact URI, and give the client a fixed callback port. |
+| `Dynamic client registration is not enabled` | The client tried to register itself, which is off by default. | Give the client a client ID, as in [step 4](#4-sign-in-from-a-client). |
+| The list of tools is empty | The per-tool policy is on and the caller has no grant. | See [LumoAuth's per-tool policy](#lumoauths-per-tool-policy). |
+| A registration change has no effect | The package reads the registration once. | Restart the server. |
+
 ## Requirements
 
-Node 20 or later. The package installs `@lumoauth/agent` and
-`@lumoauth/shared` 1.2 or later, the releases with access-token and DPoP
-verification. Install the MCP SDK yourself: the tests run against
-`@modelcontextprotocol/sdk` 1.32 and `@modelcontextprotocol/server` 2.4.
+Node 20 or later. The package installs `@lumoauth/agent` and `@lumoauth/shared` 1.2 or later, the releases with access-token and DPoP verification. Install the MCP SDK yourself: the tests run against `@modelcontextprotocol/sdk` 1.32 and `@modelcontextprotocol/server` 2.4.
+
+## License
+
+MIT
