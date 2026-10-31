@@ -1,6 +1,6 @@
 {
     "name": "lumoauth",
-    "version": "1.0.0",
+    "version": "1.2.0",
     "description": "`npx lumoauth secure`: put LumoAuth sign-in and per-tool authorization in front of an existing MCP server, without changing its code.",
     "license": "MIT",
     "author": "LumoAuth",
@@ -30,7 +30,7 @@
         "gateway"
     ],
     "dependencies": {
-        "@lumoauth/mcp": "^1.0.0",
+        "@lumoauth/mcp": "^1.2.0",
         "@modelcontextprotocol/sdk": "^1.32.2"
     },
     "devDependencies": {
