@@ -53,7 +53,7 @@ export function registrationDocument({ requireDpop = false, scopes = ['mcp:read'
  * tool-authorize requests; `allowedTools` decides them.
  */
 export function fakeLumoAuth({ allowedTools = new Set(), registration = registrationDocument(), failPolicy = false } = {}) {
-    const calls = { authorize: [], token: 0 };
+    const calls = { authorize: [], token: 0, vault: [] };
     const json = (body, status = 200) =>
         new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
     const fetch = async (input, init = {}) => {
@@ -69,7 +69,7 @@ export function fakeLumoAuth({ allowedTools = new Set(), registration = registra
         if (url === `${ISSUER}/oauth/token`) {
             calls.token += 1;
             const form = new URLSearchParams(String(init.body));
-            if (form.get('client_id') !== 'srv' || form.get('client_secret') !== 'shh' || form.get('scope') !== 'mcp:authorize') {
+            if (form.get('client_id') !== 'srv' || form.get('client_secret') !== 'shh') {
                 return json({ error: 'invalid_client' }, 401);
             }
             return json({ access_token: 'server-token', token_type: 'Bearer', expires_in: 3600 });
@@ -79,12 +79,29 @@ export function fakeLumoAuth({ allowedTools = new Set(), registration = registra
             if (headers.get('authorization') !== 'Bearer server-token') return json({ error: 'invalid_token' }, 401);
             if (failPolicy) return json({ error: 'server_error' }, 500);
             const body = JSON.parse(String(init.body));
-            calls.authorize.push(body);
+            calls.authorize.push({ ...body, traceparent: headers.get('traceparent') ?? undefined });
             const allowed = allowedTools.has(body.tool);
             return json(
                 { allowed, subject: body.subject, resource: { type: 'mcp_tool', id: `${SERVER_ID}/${body.tool}` } },
                 allowed ? 200 : 403,
             );
+        }
+        const vaultMatch = new RegExp(`^${ISSUER}/agents/me/connections/([^/]+)/token$`).exec(url);
+        if (vaultMatch) {
+            const headers = new Headers(init.headers);
+            const body = init.body ? JSON.parse(String(init.body)) : {};
+            calls.vault.push({
+                connectionId: vaultMatch[1],
+                authorization: headers.get('authorization'),
+                traceparent: headers.get('traceparent') ?? undefined,
+                body,
+            });
+            return json({
+                access_token: `vault_tok_${vaultMatch[1]}_${calls.vault.length}`,
+                token_type: 'Bearer',
+                expires_at: '2099-01-01T00:00:00Z',
+                scopes: ['repo', 'read:user'],
+            });
         }
         throw new Error(`unexpected fetch of ${url}`);
     };

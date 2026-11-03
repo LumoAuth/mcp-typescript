@@ -8,7 +8,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { McpServer as McpServerV2, createMcpHandler } from '@modelcontextprotocol/server';
 import { DpopProofSigner } from '@lumoauth/agent';
 import * as z from 'zod';
-import { getCaller, lumoAuth } from '../dist/index.mjs';
+import { getCaller, lumoAuth, parseTraceparent } from '../dist/index.mjs';
 import { ISSUER, METADATA_URL, RESOURCE, SERVER_ID, fakeLumoAuth, initialize, makeToken, registrationDocument } from './helpers.mjs';
 
 const HEADERS = {
@@ -29,8 +29,10 @@ async function rpcBody(response) {
     return JSON.parse(text);
 }
 
+const listTools = { jsonrpc: '2.0', id: 3, method: 'tools/list', params: {} };
 const callTool = (name, args = {}) => ({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name, arguments: args } });
 const textOf = (body) => body.result?.content?.[0]?.text;
+const toolNames = (body) => body.result.tools.map((t) => t.name).sort();
 
 function makeAuth(fake, extra = {}) {
     return lumoAuth({ issuer: ISSUER, serverId: SERVER_ID, orgId: 'acme', lumoauthUrl: 'https://app.lumoauth.dev', fetch: fake.fetch, clientId: 'srv', clientSecret: 'shh', env: {}, ...extra });
@@ -39,14 +41,17 @@ function makeAuth(fake, extra = {}) {
 // ── SDK v1: Express + StreamableHTTPServerTransport ─────────────────
 
 describe('MCP SDK v1 (Express)', () => {
-    const fake = fakeLumoAuth({ allowedTools: new Set(['whoami', 'refund']) });
+    const fake = fakeLumoAuth({ allowedTools: new Set(['whoami', 'refund', 'wireTransfer', 'githubIssue']) });
     const auth = makeAuth(fake);
     let base;
     let listener;
 
     function buildServer() {
         const server = new McpServerV1({ name: 'invoices', version: '1.0.0' });
-        auth.secureTools(server, { scopes: { refund: ['invoices:refund'] } });
+        auth.secureTools(server, {
+            scopes: { refund: ['invoices:refund'] },
+            jit: { wireTransfer: { type: 'payment_initiation', actions: ['wire'] } },
+        });
         server.registerTool('whoami', { description: 'Who is calling' }, async (extra) => ({
             content: [{ type: 'text', text: JSON.stringify(getCaller(extra)) }],
         }));
@@ -55,6 +60,26 @@ describe('MCP SDK v1 (Express)', () => {
             { description: 'Refund an invoice', inputSchema: { invoiceId: z.string() } },
             async ({ invoiceId }) => ({ content: [{ type: 'text', text: `refunded ${invoiceId}` }] }),
         );
+        server.registerTool(
+            'wireTransfer',
+            { description: 'High-risk wire transfer', inputSchema: { amount: z.number() } },
+            async ({ amount }) => ({ content: [{ type: 'text', text: `wired ${amount}` }] }),
+        );
+        server.registerTool('githubIssue', { description: 'Fetch GitHub token from Vault' }, async (extra) => {
+            const tok = await auth.vaultToken('conn_github', extra);
+            return {
+                content: [
+                    {
+                        type: 'text',
+                        text: JSON.stringify({
+                            accessToken: tok.accessToken,
+                            userId: tok.userId ?? null,
+                            headers: tok.headers(),
+                        }),
+                    },
+                ],
+            };
+        });
         server.registerTool('export', { description: 'Export everything' }, async () => ({
             content: [{ type: 'text', text: 'exported' }],
         }));
@@ -136,6 +161,79 @@ describe('MCP SDK v1 (Express)', () => {
         });
         assert.equal(response.status, 200);
     });
+
+    test('secureTools filters tools/list by both local scopes and LumoAuth ToolPolicy (SDK v1)', async () => {
+        // Without invoices:refund scope: refund (missing scope) and export (denied by policy) are hidden
+        const basicList = await rpcBody(await post(listTools, { authorization: `Bearer ${makeToken()}` }));
+        assert.deepEqual(toolNames(basicList), ['githubIssue', 'whoami', 'wireTransfer']);
+
+        // With invoices:* scope: refund is now included, export is still hidden by LumoAuth policy
+        const fullList = await rpcBody(
+            await post(listTools, { authorization: `Bearer ${makeToken({ scope: 'mcp:read invoices:*' })}` }),
+        );
+        assert.deepEqual(toolNames(fullList), ['githubIssue', 'refund', 'whoami', 'wireTransfer']);
+    });
+
+    test('JIT / RAR guard enforces authorization_details and accepts X-LumoAuth-Jit-Token', async () => {
+        // 1. Denied without JIT details, returning authorization_details_hint
+        const denied = await rpcBody(
+            await post(callTool('wireTransfer', { amount: 5000 }), { authorization: `Bearer ${makeToken()}` }),
+        );
+        assert.equal(denied.result.isError, true);
+        assert.match(textOf(denied), /payment_initiation/);
+        assert.match(textOf(denied), /authorization_details_hint/);
+
+        // 2. Allowed when X-LumoAuth-Jit-Token carries matching permissions.authorization_details
+        const jitToken = makeToken({
+            sub: 'user-123',
+            aud: ISSUER,
+            jit: true,
+            permissions: {
+                jit_request_id: 'jit_req_99',
+                authorization_details: [{ type: 'payment_initiation', actions: ['wire'] }],
+            },
+        });
+        const allowed = await rpcBody(
+            await post(callTool('wireTransfer', { amount: 5000 }), {
+                authorization: `Bearer ${makeToken({ sub: 'user-123' })}`,
+                'x-lumoauth-jit-token': jitToken,
+            }),
+        );
+        assert.equal(textOf(allowed), 'wired 5000');
+    });
+
+    test('Token Vault helper resolves user_id for delegated callers and propagates W3C traceparent', async () => {
+        const tp = '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01';
+        assert.deepEqual(parseTraceparent(tp), {
+            traceparent: tp,
+            traceId: '4bf92f3577b34da6a3ce929d0e0e4736',
+        });
+        assert.equal(parseTraceparent('invalid'), undefined);
+
+        const delegatedToken = makeToken({
+            sub: 'user-delegator-7',
+            act: { sub: 'agent_agt_42', sub_profile: 'ai_agent' },
+        });
+        const resp = await rpcBody(
+            await post(callTool('githubIssue'), {
+                authorization: `Bearer ${delegatedToken}`,
+                traceparent: tp,
+            }),
+        );
+        const data = JSON.parse(textOf(resp));
+        assert.equal(data.accessToken, 'vault_tok_conn_github_1');
+        assert.equal(data.userId, 'user-delegator-7');
+        assert.deepEqual(data.headers, { Authorization: 'Bearer vault_tok_conn_github_1' });
+
+        // Verify traceparent was forwarded to both /tools/authorize and /agents/me/connections/conn_github/token
+        const authCall = fake.calls.authorize.find(
+            (c) => c.tool === 'githubIssue' && c.subject.id === 'user-delegator-7',
+        );
+        assert.equal(authCall.traceparent, tp);
+        assert.equal(fake.calls.vault.length, 1);
+        assert.equal(fake.calls.vault[0].traceparent, tp);
+        assert.deepEqual(fake.calls.vault[0].body, { user_id: 'user-delegator-7' });
+    });
 });
 
 // ── SDK v2: createMcpHandler (web-standard fetch) ───────────────────
@@ -158,6 +256,9 @@ describe('MCP SDK v2 (createMcpHandler)', () => {
             },
             async ({ invoiceId }) => ({ content: [{ type: 'text', text: `refunded ${invoiceId}` }] }),
         );
+        server.registerTool('export', { description: 'Export everything' }, async () => ({
+            content: [{ type: 'text', text: 'exported' }],
+        }));
         return server;
     });
 
@@ -198,5 +299,11 @@ describe('MCP SDK v2 (createMcpHandler)', () => {
         assert.match(challenge, new RegExp(`resource_metadata="${METADATA_URL}"`));
         const allowed = await post(callTool('refund', { invoiceId: 'inv_2' }), { authorization: `Bearer ${makeToken({ scope: 'invoices:*' })}` });
         assert.equal(textOf(await rpcBody(allowed)), 'refunded inv_2');
+    });
+
+    test('secureTools filters tools/list on SDK v2 McpServer', async () => {
+        const response = await post(listTools, { authorization: `Bearer ${makeToken()}` });
+        assert.equal(response.status, 200);
+        assert.deepEqual(toolNames(await rpcBody(response)), ['refund', 'whoami']);
     });
 });

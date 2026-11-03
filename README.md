@@ -29,6 +29,7 @@ Three lines for the official TypeScript SDK. One command for everything else.
 | --- | --- | --- |
 | A server built with the official TypeScript SDK, v1 or v2 | [`@lumoauth/mcp`](packages/mcp) | [Quick start](packages/mcp#quick-start) |
 | Any other MCP server, in any language, over HTTP or stdio | [`npx lumoauth secure`](packages/lumoauth) | [Quick start](packages/lumoauth#quick-start) |
+| An Envoy proxy or Kubernetes service mesh | [`npx lumoauth ext-authz`](packages/lumoauth#kubernetes-sidecar-and-envoy-ext_authz) | [Deployment guide](packages/lumoauth#kubernetes-sidecar-and-envoy-ext_authz) |
 | A FastMCP server in Python | [`lumoauth-fastmcp`](https://github.com/LumoAuth/mcp-fastmcp) | [Quick start](https://github.com/LumoAuth/mcp-fastmcp#quick-start) |
 
 **Inside your server**, three lines with Express:
@@ -86,6 +87,26 @@ Grant each tool to a person or an agent in LumoAuth. A change applies within 30 
 
 </td>
 </tr>
+<tr>
+<td valign="top">
+
+**Step-up approval (JIT)**<br>
+Require human approval (RFC 9396 `authorization_details`) before an agent can run a sensitive tool.
+
+</td>
+<td valign="top">
+
+**Token Vault for SaaS APIs**<br>
+Fetch short-lived GitHub, Slack, or Jira tokens (`auth.vaultToken(...)` or `--vault`) scoped to the caller.
+
+</td>
+<td valign="top">
+
+**Tracing & K8s / Envoy**<br>
+Propagate W3C `traceparent` headers to LumoAuth's audit log, and deploy as a Kubernetes sidecar or Envoy `ext_authz` filter.
+
+</td>
+</tr>
 </table>
 
 ## How it works
@@ -104,10 +125,11 @@ These packages do not proxy OAuth flows or issue tokens. They give your server t
 1. **Discovery.** Serve protected resource metadata at the server's own origin. It names the organization's issuer, so clients find LumoAuth through `{issuer}/.well-known/openid-configuration`.
 2. **Challenge.** Answer `401` with `WWW-Authenticate` pointing to that document. The challenge carries the registration's basic scopes, uses the `DPoP` scheme when the registration requires DPoP, and states the real reason when a token is rejected.
 3. **Verification.** Verify LumoAuth's `at+jwt` tokens locally with the LumoAuth SDK's verifier (`@lumoauth/agent`), including the DPoP binding. LumoAuth's rule for comparing resource URIs applies to audiences too, so `https://x.example.com` and `https://x.example.com/` both match.
-4. **Identity.** Give tools the verified caller: user or agent, the delegation chain, scopes and capabilities.
-5. **Authorization.** Check scopes with LumoAuth's wildcard rule, check the caller (people only, or agents with capabilities), and ask LumoAuth's per-tool policy. The server asks with its own client-credentials token and never forwards the caller's token.
+4. **Identity & Tracing.** Give tools the verified caller: user or agent, the delegation chain, scopes, capabilities, JIT `authorizationDetails`, and W3C `traceparent` / `traceId`.
+5. **Authorization & Step-up (JIT).** Check scopes with LumoAuth's wildcard rule, check the caller (people only, or agents with capabilities), require RFC 9396 Just-in-Time approvals for high-risk tools, ask LumoAuth's per-tool policy, and filter `tools/list` so callers only see tools they are permitted to run. The server asks with its own client-credentials token and never forwards the caller's token.
+6. **Token Vault.** Exchange the verified caller's context for short-lived outbound OAuth tokens (GitHub, Slack, Jira, Google Workspace) from LumoAuth's Token Vault without exposing refresh tokens.
 
-`lumoauth secure` does the same steps as a reverse proxy, for servers whose code you do not want to change.
+`lumoauth secure` and `lumoauth ext-authz` do the same steps as a reverse proxy or Envoy authorization service, for servers whose code you do not want to change.
 
 ### Standards
 
@@ -117,6 +139,8 @@ These packages do not proxy OAuth flows or issue tokens. They give your server t
 | Resource indicators | RFC 8707 |
 | DPoP | RFC 9449 |
 | JWT access tokens (`at+jwt`) | RFC 9068 |
+| Rich Authorization Requests (JIT step-up) | RFC 9396 |
+| Distributed Trace Context (`traceparent`) | W3C Trace Context |
 | Model Context Protocol authorization | MCP Authorization specification |
 
 ## Development

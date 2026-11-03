@@ -1,0 +1,96 @@
+# Kubernetes Sidecar Deployment for securing any internal MCP server with LumoAuth
+# The MCP server listens on localhost:8000 (loopback only); the lumoauth-proxy
+# sidecar listens on 0.0.0.0:8080, serves RFC 9728 discovery, verifies Bearer/DPoP
+# tokens, enforces per-tool Zanzibar policies + JIT step-up, and injects verified
+# X-LumoAuth-* and X-LumoAuth-Vault-*-Token headers to the upstream container.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-server-secured
+  labels:
+    app.kubernetes.io/name: mcp-server-secured
+    lumoauth.dev/protected: "true"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mcp-server-secured
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mcp-server-secured
+    spec:
+      containers:
+        - name: lumoauth-proxy
+          image: ghcr.io/lumoauth/lumoauth-mcp:1.0.0
+          args:
+            - secure
+            - --upstream=http://127.0.0.1:8000/mcp
+            - --port=8080
+            - --public=/healthz
+            - --tool-policy
+          ports:
+            - name: http-mcp
+              containerPort: 8080
+          env:
+            - name: LUMOAUTH_ORG_ID
+              valueFrom:
+                secretKeyRef:
+                  name: lumoauth-mcp-credentials
+                  key: org_id
+            - name: LUMOAUTH_MCP_SERVER_ID
+              valueFrom:
+                secretKeyRef:
+                  name: lumoauth-mcp-credentials
+                  key: server_id
+            - name: LUMOAUTH_MCP_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: lumoauth-mcp-credentials
+                  key: client_id
+            - name: LUMOAUTH_MCP_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: lumoauth-mcp-credentials
+                  key: client_secret
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http-mcp
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http-mcp
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            readinessProbe: null
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+        - name: mcp-upstream
+          image: example/internal-mcp-server:latest
+          env:
+            - name: HOST
+              value: "127.0.0.1"
+            - name: PORT
+              value: "8000"
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-server-secured
+spec:
+  selector:
+    app.kubernetes.io/name: mcp-server-secured
+  ports:
+    - name: http-mcp
+      port: 80
+      targetPort: http-mcp

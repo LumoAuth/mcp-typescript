@@ -16,7 +16,7 @@
 [![MCP SDK v1 and v2](https://img.shields.io/badge/mcp%20sdk-v1%20%C2%B7%20v2-111)](#other-setups)
 [![License: MIT](https://img.shields.io/badge/license-MIT-111)](#license)
 
-[Quick start](#quick-start) · [Other setups](#other-setups) · [Who is calling](#who-is-calling) · [Per-tool authorization](#per-tool-authorization) · [Troubleshooting](#troubleshooting) · [Docs](https://docs.lumoauth.dev/mcp/)
+[Quick start](#quick-start) · [Other setups](#other-setups) · [Who is calling](#who-is-calling) · [Per-tool authorization](#per-tool-authorization) · [Step-up approval (JIT)](#step-up-approval-for-sensitive-tools-jit) · [Token Vault](#calling-third-party-apis-with-token-vault) · [Tracing](#distributed-tracing-traceparent) · [Troubleshooting](#troubleshooting) · [Docs](https://docs.lumoauth.dev/mcp/)
 
 </div>
 
@@ -217,15 +217,20 @@ app.post('/mcp', auth.protect(), (req, res) => mcp(req, res, req.body));
 | `scopes`, `capabilities` | Granted scopes; the agent's capabilities |
 | `clientId` | The OAuth client (RFC 9068 `client_id`) |
 | `dpopJkt` | The key thumbprint of a DPoP-bound token |
+| `isJit`, `authorizationDetails` | `true` when the caller holds a Just-in-Time (RFC 9396) approval, and its granted details |
+| `traceparent`, `traceId` | Validated W3C `traceparent` header and 32-character trace ID of the request |
 | `claims` | All verified claims |
 
 ## Per-tool authorization
 
-`auth.secureTools(server, options)` guards every tool that is registered after the call. `scopes` maps tool names to the scopes that they need:
+`auth.secureTools(server, options)` guards every tool on an SDK v1 or v2 `McpServer` (whether registered before or after `secureTools`) **and filters `tools/list` responses** so callers only see tools they are allowed to run:
 
 ```ts
 const server = new McpServer({ name: 'invoices', version: '1.0.0' });
-auth.secureTools(server, { scopes: { refund: ['invoices:refund'] } });
+auth.secureTools(server, {
+    scopes: { refund: ['invoices:refund'] },
+    jit: { wireTransfer: { type: 'payment_initiation', actions: ['wire'] } },
+});
 server.registerTool('refund', { inputSchema: { invoiceId: z.string() } }, async ({ invoiceId }) => ...);
 ```
 
@@ -241,7 +246,10 @@ The options:
 - `scopes`: the scopes that the tool needs. As in LumoAuth, a granted scope that ends in `:*` (such as `invoices:*`) covers the scopes under it, and every other scope compares exactly. Prefer narrow scopes, because the MCP security best practices list wildcard scopes as a common mistake.
 - `agents: true` or `agents: ['billing.reminders']`: AI agents only, with these capabilities.
 - `users: true`: people only. `users: 'delegated'` also admits an agent that acts for a person.
+- `jit`: require a Just-in-Time (RFC 9396 `authorization_details`) grant for the tool. See [Step-up approval for sensitive tools (JIT)](#step-up-approval-for-sensitive-tools-jit).
 - `policy`: ask LumoAuth's per-tool policy. This is on by default when the server's client credentials are set, as described below.
+- `filterList`: hide unauthorized tools from `tools/list` responses (default `true`). Local checks (`scopes`, `agents`, `users`) run first, followed by concurrent LumoAuth policy checks.
+- `hideJitUntilGranted`: when `true`, `tools/list` also hides tools whose `jit` requirement is not yet met (default `false` so agents can discover the tool and trigger step-up on `tools/call`).
 - `allowUnauthenticated: true`: run the tool on a request without auth info, as on stdio. By default, such a call is rejected.
 
 A rejected call becomes an error result that the model can read. With SDK v2, `scopeChallenge: auth.scopeChallenge('invoices:refund')` on `registerTool` turns a missing scope into a `403 insufficient_scope` step-up instead. The client can then ask the user for the scope.
@@ -269,6 +277,94 @@ Relationships are part of the Fine-grained authorization add-on. Without it, eve
 
 Decisions are cached for 30 seconds (`toolDecisionTtl`). When LumoAuth cannot be reached, the tool is rejected.
 
+## Step-up approval for sensitive tools (JIT)
+
+**Why it is useful:** Some tools—such as initiating a wire transfer, issuing a large refund, or mutating production data—are too risky for an AI agent to execute with a standing token alone. With Just-in-Time (JIT) authorization (RFC 9396 Rich Authorization Requests), your tool requires a short-lived, task-bound approval. When an agent calls the tool without one, `@lumoauth/mcp` rejects the call with an `insufficient_authorization_details` error containing the exact `authorization_details_hint` so the agent can ask a human for approval (for example, via Slack or mobile push) and retry.
+
+### Requiring JIT approval on a tool
+
+Pass `jit` in `auth.secureTools()` or `auth.guard()`:
+
+```ts
+auth.secureTools(server, {
+    jit: {
+        wireTransfer: {
+            type: 'payment_initiation',
+            actions: ['wire'],
+            locations: ['https://api.stripe.com'],
+        },
+    },
+});
+```
+
+Or on a single tool handler:
+
+```ts
+server.registerTool(
+    'wireTransfer',
+    { inputSchema: { amount: z.number() } },
+    auth.guard(
+        'wireTransfer',
+        async ({ amount }) => ({ content: [{ type: 'text', text: `Wired ${amount}` }] }),
+        { jit: { type: 'payment_initiation', actions: ['wire'] } },
+    ),
+);
+```
+
+### How clients send a JIT token
+
+A client can present its JIT approval in two ways:
+1. Directly inside the MCP access token (`authorization_details` or `permissions.authorization_details`).
+2. Alongside its normal MCP token in the `X-LumoAuth-Jit-Token` HTTP header. `@lumoauth/mcp` verifies the JIT token against your organization's JWKS and issuer, confirms that its `sub` matches the MCP caller (`caller.sub` or `caller.actor`), and merges its `authorization_details` into `caller.authorizationDetails`.
+
+## Calling third-party APIs with Token Vault
+
+**Why it is useful:** Most MCP tools call an upstream SaaS API such as GitHub, Slack, Jira, Google Workspace, or Salesforce. Storing a shared static API key on your MCP server gives every caller the same access, while forwarding the caller's own token violates the MCP specification. LumoAuth's Token Vault holds encrypted refresh tokens in custody and mints short-lived outbound access tokens on demand.
+
+### Fetching a token with `auth.vaultToken()`
+
+Set `LUMOAUTH_AGENT_TOKEN` (or `LUMOAUTH_MCP_CLIENT_ID` and `LUMOAUTH_MCP_CLIENT_SECRET`), then call `await auth.vaultToken(connectionId, extra)` inside your tool handler:
+
+```ts
+server.registerTool(
+    'create_github_issue',
+    { inputSchema: { repo: z.string(), title: z.string() } },
+    async ({ repo, title }, extra) => {
+        // Fetches a short-lived GitHub token from LumoAuth's Token Vault
+        const gh = await auth.vaultToken('conn_github_prod', extra);
+
+        const response = await fetch(`https://api.github.com/repos/${repo}/issues`, {
+            method: 'POST',
+            headers: {
+                ...gh.headers(),
+                Accept: 'application/vnd.github+json',
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ title }),
+        });
+        const issue = await response.json();
+        return { content: [{ type: 'text', text: JSON.stringify(issue) }] };
+    },
+);
+```
+
+### Automatic user delegation
+
+When you pass `extra` (SDK v1), `ctx` (SDK v2), or `caller` to `auth.vaultToken(connectionId, extra)`:
+- **Person or delegated agent (`!caller.isAgent || caller.isDelegated`):** Automatically sends `{"user_id": caller.sub}` so the tool uses that person's connected account.
+- **Autonomous agent (`caller.isAgent` without delegation):** Requests the agent's own connection token.
+- **Explicit override:** Pass `await auth.vaultToken('conn_github_prod', { userId: 'user-123', caller })`.
+
+Returned `VaultToken` objects are cached in memory until 30 seconds before `expiresAt` (`vaultTokenTtl`, default 60 seconds).
+
+## Distributed tracing (`traceparent`)
+
+**Why it is useful:** When an AI agent makes a chain of MCP tool calls traced in Langfuse, LangSmith, Arize, or OpenTelemetry, you want to connect the agent trace to the exact tool policy and Token Vault decisions in LumoAuth's audit log.
+
+**How it works:** When a request arrives with a W3C `traceparent` HTTP header (`00-<trace-id>-<span-id>-<flags>`):
+1. `@lumoauth/mcp` validates the header and populates `caller.traceparent` and `caller.traceId`.
+2. `auth.toolPolicy()` and `auth.vaultToken()` automatically forward the `traceparent` header to LumoAuth, which records `traceId` on the resulting `mcp.tool.authorization` and Token Vault audit events.
+
 ## Configuration
 
 | Option | Environment variable | Default |
@@ -278,7 +374,9 @@ Decisions are cached for 30 seconds (`toolDecisionTtl`). When LumoAuth cannot be
 | `resource` | `LUMOAUTH_MCP_RESOURCE` | from the registration |
 | `lumoauthUrl` | `LUMOAUTH_URL` | `https://app.lumoauth.dev` |
 | `issuer` | `LUMOAUTH_ISSUER` | `{lumoauthUrl}/orgs/{orgId}/api/v1` (set it for a custom domain) |
-| `clientId`, `clientSecret` | `LUMOAUTH_MCP_CLIENT_ID`, `LUMOAUTH_MCP_CLIENT_SECRET` | only for the per-tool policy |
+| `clientId`, `clientSecret` | `LUMOAUTH_MCP_CLIENT_ID`, `LUMOAUTH_MCP_CLIENT_SECRET` | for the per-tool policy and `vaultToken()` |
+| `agentToken` | `LUMOAUTH_AGENT_TOKEN` | agent bearer token for `vaultToken()` (optional when client credentials are set) |
+| `vaultTokenTtl` | | seconds to cache a Token Vault token (default `60`; `0` disables) |
 | `requiredScopes` | | none |
 | `scopesSupported` | | the registration's basic scopes |
 | `requireDpop` | | the registration's **Require DPoP** switch |

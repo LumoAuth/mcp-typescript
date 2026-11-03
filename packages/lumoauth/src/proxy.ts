@@ -4,13 +4,24 @@ import { pipeline } from 'node:stream/promises';
 import type { ReadableStream as NodeReadableStream } from 'node:stream/web';
 import {
     LumoAuthChallenge,
+    missingAuthorizationDetails,
+    normalizeAuthorizationDetails,
+    parseTraceparent,
     writeChallenge,
+    type AuthorizationDetail,
     type LumoAuthInfo,
     type LumoCaller,
     type LumoMcpAuth,
     type SimpleResponse,
 } from '@lumoauth/mcp';
-import { filterJsonBody, filterSseEvent, inspect, refusedToolResult, type Inspection } from './jsonrpc';
+import {
+    filterJsonBody,
+    filterSseEvent,
+    inspect,
+    refusedJitToolResult,
+    refusedToolResult,
+    type Inspection,
+} from './jsonrpc';
 import type { StdioBridge } from './stdio';
 
 /**
@@ -45,6 +56,14 @@ export interface ProxyOptions {
     identityHeaders: boolean;
     /** Paths forwarded without authentication (health checks). */
     publicPaths: string[];
+    /** Optional per-tool JIT / RAR `authorization_details` requirements. */
+    jit?: Record<string, string | AuthorizationDetail | AuthorizationDetail[]>;
+    /**
+     * Optional Token Vault connections (`{ providerSlug: connectionId }`) whose
+     * short-lived outbound tokens are injected as `X-LumoAuth-Vault-<Slug>-Token`
+     * headers on upstream requests.
+     */
+    vaultConnections?: Record<string, string>;
     /** Largest request body to buffer (default 4 MiB). */
     maxBodyBytes?: number;
     log?: (line: string) => void;
@@ -189,6 +208,19 @@ export function createSecureProxy(options: ProxyOptions): Server {
             if (caller.actor) headers.set('x-lumoauth-actor', caller.actor);
             if (caller.clientId) headers.set('x-lumoauth-client-id', caller.clientId);
             headers.set('x-lumoauth-scopes', caller.scopes.join(' '));
+            if (caller.traceId) headers.set('x-lumoauth-trace-id', caller.traceId);
+            if (caller.isJit) headers.set('x-lumoauth-is-jit', 'true');
+        }
+        if (caller?.traceparent && !headers.has('traceparent')) {
+            headers.set('traceparent', caller.traceparent);
+        }
+        if (caller && options.vaultConnections) {
+            for (const [slug, connectionId] of Object.entries(options.vaultConnections)) {
+                const cleanSlug = slug.trim().toLowerCase().replace(/[^a-z0-9-]/g, '-');
+                if (!cleanSlug || !connectionId) continue;
+                const vaultToken = await auth.vaultToken(connectionId, caller);
+                headers.set(`x-lumoauth-vault-${cleanSlug}-token`, vaultToken.accessToken);
+            }
         }
 
         const controller = new AbortController();
@@ -286,22 +318,51 @@ export function createSecureProxy(options: ProxyOptions): Server {
 
         const body = method === 'POST' ? await readBody(req, maxBody) : undefined;
         let inspection: Inspection | undefined;
-        if (body && options.toolPolicy) {
+        if (body && (options.toolPolicy || options.jit)) {
             inspection = inspect(body.toString('utf8'));
-            const refused: Inspection['toolCalls'] = [];
-            for (const call of inspection.toolCalls) {
-                if (!(await auth.toolPolicy().isAllowed(caller, call.name))) refused.push(call);
-            }
-            if (refused.length > 0) {
-                const reason = (name: string) => `LumoAuth policy does not allow this caller to run '${name}'.`;
-                log(`lumoauth: refused ${refused.map((c) => c.name).join(', ')} for ${caller.sub}`);
-                if (inspection.isBatch) {
-                    // Batches (MCP 2025-03-26 only) are refused whole.
-                    writeJson(res, 200, inspection.toolCalls.map((c) => refusedToolResult(c.id, reason(refused[0].name))));
-                } else {
-                    writeJson(res, 200, refusedToolResult(refused[0].id, reason(refused[0].name)));
+            if (!caller.traceparent && inspection.traceparent) {
+                const parsedTp = parseTraceparent(inspection.traceparent);
+                if (parsedTp) {
+                    caller.traceparent = parsedTp.traceparent;
+                    caller.traceId ??= parsedTp.traceId;
                 }
-                return;
+            }
+            if (options.toolPolicy) {
+                const refused: Inspection['toolCalls'] = [];
+                for (const call of inspection.toolCalls) {
+                    if (!(await auth.toolPolicy().isAllowed(caller, call.name))) refused.push(call);
+                }
+                if (refused.length > 0) {
+                    const reason = (name: string) => `LumoAuth policy does not allow this caller to run '${name}'.`;
+                    log(`lumoauth: refused ${refused.map((c) => c.name).join(', ')} for ${caller.sub}`);
+                    if (inspection.isBatch) {
+                        // Batches (MCP 2025-03-26 only) are refused whole.
+                        writeJson(res, 200, inspection.toolCalls.map((c) => refusedToolResult(c.id, reason(refused[0].name))));
+                    } else {
+                        writeJson(res, 200, refusedToolResult(refused[0].id, reason(refused[0].name)));
+                    }
+                    return;
+                }
+            }
+            if (options.jit) {
+                for (const call of inspection.toolCalls) {
+                    const jitSpec = options.jit[call.name];
+                    if (!jitSpec) continue;
+                    const required = normalizeAuthorizationDetails(jitSpec);
+                    const missing = missingAuthorizationDetails(required, caller.authorizationDetails);
+                    if (missing.length > 0) {
+                        const jitRefusal = refusedJitToolResult(call.id, call.name, missing);
+                        res.setHeader('Insufficient-Authorization-Details', jitRefusal.headerValue);
+                        writeJson(
+                            res,
+                            200,
+                            inspection.isBatch
+                                ? inspection.toolCalls.map((c) => refusedJitToolResult(c.id, call.name, missing).body)
+                                : jitRefusal.body,
+                        );
+                        return;
+                    }
+                }
             }
         }
         if (options.bridge) {

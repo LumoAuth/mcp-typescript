@@ -16,7 +16,7 @@
 [![HTTP and stdio](https://img.shields.io/badge/servers-HTTP%20%C2%B7%20stdio-111)](#what-it-does)
 [![License: MIT](https://img.shields.io/badge/license-MIT-111)](#license)
 
-[Quick start](#quick-start) · [What it does](#what-it-does) · [Per-tool policy](#per-tool-policy) · [Options](#options) · [Troubleshooting](#troubleshooting) · [Docs](https://docs.lumoauth.dev/mcp/)
+[Quick start](#quick-start) · [What it does](#what-it-does) · [Per-tool policy](#per-tool-policy) · [Step-up approval (JIT)](#step-up-approval-for-sensitive-tools---jit) · [Token Vault](#injecting-third-party-api-tokens-from-token-vault---vault) · [Tracing](#distributed-tracing-traceparent) · [Kubernetes & Envoy](#kubernetes-sidecar-and-envoy-ext_authz) · [Options](#options) · [Troubleshooting](#troubleshooting) · [Docs](https://docs.lumoauth.dev/mcp/)
 
 </div>
 
@@ -31,6 +31,9 @@ npx lumoauth secure --upstream http://127.0.0.1:8000/mcp -- python server.py
 
 # A stdio MCP server, served over HTTP behind LumoAuth
 npx lumoauth secure --stdio -- npx -y @modelcontextprotocol/server-everything
+
+# Run as an Envoy HTTP ext_authz check service in Kubernetes / service mesh
+npx lumoauth ext-authz --port 9001 --tool-policy
 ```
 
 [LumoAuth](https://lumoauth.dev) signs users in and issues the tokens. `lumoauth` checks each token before anything reaches your server. It works with a server in any language. Building with the official TypeScript SDK? [`@lumoauth/mcp`](https://www.npmjs.com/package/@lumoauth/mcp) does the same inside your code.
@@ -141,6 +144,9 @@ Other MCP clients connect the same way if they let you set a client ID and a cal
 | `X-LumoAuth-Actor` | The agent acting for the user |
 | `X-LumoAuth-Client-Id` | The OAuth client |
 | `X-LumoAuth-Scopes` | The granted scopes |
+| `X-LumoAuth-Trace-Id` | The 32-character W3C trace ID, when `traceparent` is present |
+| `X-LumoAuth-Is-Jit` | `true` when the request carries a verified Just-in-Time approval |
+| `X-LumoAuth-Vault-<Slug>-Token` | Short-lived SaaS token fetched from LumoAuth's Token Vault (when `--vault` is used) |
 
 **HTTP mode** works with any MCP server and any protocol revision. It reads JSON-RPC only to apply the tool policy, and it streams everything else.
 
@@ -164,6 +170,63 @@ With the policy on, `lumoauth` asks LumoAuth about each tool and hides the tools
    | One tool | `mcp_tool` | `mcp_0123456789abcdef01234567/refund` | `invoke` | `agent` and the agent's id |
 
 Relationships are part of the Fine-grained authorization add-on. Without it, every tool is denied.
+
+## Step-up approval for sensitive tools (`--jit`)
+
+**Why it is useful:** Some tools—such as refunding an invoice, wiring funds, or deleting production data—should never run with a standing token alone. With `--jit`, the proxy inspects `tools/call` requests before they reach your server and requires a short-lived Just-in-Time approval (RFC 9396 `authorization_details`). If the caller does not have one, the proxy answers with an `insufficient_authorization_details` tool error and an `Insufficient-Authorization-Details` header so the agent can ask a human for approval (via Slack or mobile push) and retry.
+
+```bash
+npx lumoauth secure \
+  --upstream http://127.0.0.1:8000/mcp \
+  --jit refund=payment_initiation:refund \
+  --jit delete_user=user_management:delete,purge
+```
+
+Clients can present the JIT approval either inside the MCP access token (`authorization_details`) or in the `X-LumoAuth-Jit-Token` HTTP header.
+
+## Injecting third-party API tokens from Token Vault (`--vault`)
+
+**Why it is useful:** If your upstream MCP server calls GitHub, Slack, Jira, or Google Workspace, you do not need to hardcode shared API keys or modify the server to integrate with LumoAuth's SDK. With `--vault <slug>=<connection_id>`, `lumoauth` fetches a short-lived access token from LumoAuth's Token Vault for the verified caller (automatically passing `user_id` when the caller is a person or an agent acting for a person) and injects it into the upstream request as `X-LumoAuth-Vault-<Slug>-Token`:
+
+```bash
+export LUMOAUTH_AGENT_TOKEN=agk_...
+
+npx lumoauth secure \
+  --upstream http://127.0.0.1:8000/mcp \
+  --vault github=conn_github_prod \
+  --vault slack=conn_slack_workspace
+```
+
+Your upstream server simply reads the `X-LumoAuth-Vault-Github-Token` and `X-LumoAuth-Vault-Slack-Token` headers. Any client-supplied `X-LumoAuth-*` headers are always stripped first.
+
+## Distributed tracing (`traceparent`)
+
+**Why it is useful:** When an AI agent runs a multi-step workflow traced in Langfuse, LangSmith, Arize, or OpenTelemetry, you want to connect the agent trace to the exact tool authorization and Token Vault events in LumoAuth's audit log.
+
+**How it works:** When a request arrives with a W3C `traceparent` HTTP header (or `params._meta.traceparent` inside a JSON-RPC request body), `lumoauth` validates it, forwards `traceparent` to LumoAuth on `/tools/authorize` and Token Vault requests, and passes both `traceparent` and `X-LumoAuth-Trace-Id` to your upstream server.
+
+## Kubernetes sidecar and Envoy `ext_authz`
+
+**Why it is useful:** Platform teams running dozens of internal MCP servers in Kubernetes can secure them declaratively as a sidecar container or through an Envoy / Istio service mesh without touching application containers.
+
+### Envoy `ext_authz` mode
+
+Run `npx lumoauth ext-authz` (or `npx lumoauth secure --ext-authz`) to start an Envoy HTTP `ext_authz` check server:
+
+```bash
+npx lumoauth ext-authz --port 9001 --tool-policy --jit refund=payment_initiation:refund
+```
+
+For each incoming request forwarded by Envoy (`envoy.filters.http.ext_authz`):
+- Returns `200 OK` for public health paths (`--public /healthz`) and serves RFC 9728 discovery documents at `/.well-known/*`.
+- Returns `401` or `403` with `WWW-Authenticate` challenges when the Bearer or DPoP token is missing or invalid.
+- Inspects buffered JSON-RPC `tools/call` bodies (`with_request_body` in Envoy) to enforce LumoAuth's per-tool policy and `--jit` step-up requirements before the request reaches the upstream pod.
+- Returns `200 OK` with `X-LumoAuth-*`, `X-LumoAuth-Vault-*-Token`, and `traceparent` headers for Envoy to inject into the upstream request.
+
+Ready-to-use deployment manifests are included in the repository:
+- [`Dockerfile`](../../Dockerfile) — multi-stage non-root (`65532:65532`) container image with `/healthz` healthcheck.
+- [`deploy/kubernetes-sidecar.yaml`](../../deploy/kubernetes-sidecar.yaml) — Kubernetes Deployment running `lumoauth` as a sidecar in front of a loopback MCP container.
+- [`deploy/envoy-ext-authz.yaml`](../../deploy/envoy-ext-authz.yaml) — Envoy configuration with `with_request_body` JSON-RPC inspection and upstream identity header injection.
 
 ## Check the setup
 
@@ -191,10 +254,13 @@ Run `npx lumoauth --help` for all of them. The common ones:
 | `--lumoauth-url` | `LUMOAUTH_URL` | `https://eu.app.lumoauth.dev` for the EU region |
 | `--upstream` | | The MCP endpoint to protect |
 | `--stdio` | | The command after `--` is a stdio server |
+| `--ext-authz` | | Run as an Envoy HTTP `ext_authz` check server |
 | `--port`, `--host` | `PORT` | Where to listen (default `0.0.0.0:8080`) |
 | `--path` | | Public path of the MCP endpoint (default: the Resource URI's path) |
 | `--scope` | | A scope that every request needs (repeatable) |
 | `--public` | | A path that needs no token, such as `/health` (repeatable) |
+| `--jit` | | Require a JIT/RAR grant for a tool, e.g. `refund=payment:refund` (repeatable) |
+| `--vault` | `LUMOAUTH_AGENT_TOKEN` | Inject `X-LumoAuth-Vault-<Slug>-Token` from Token Vault, e.g. `github=conn_123` (repeatable) |
 
 ## Troubleshooting
 

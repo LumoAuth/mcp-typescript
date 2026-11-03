@@ -1,5 +1,6 @@
 import { parseArgs } from 'node:util';
-import { lumoAuth, type LumoMcpAuth } from '@lumoauth/mcp';
+import { lumoAuth, type AuthorizationDetail, type LumoMcpAuth } from '@lumoauth/mcp';
+import { createExtAuthzServer } from './ext-authz';
 import { allowedToolNames, createSecureProxy } from './proxy';
 import { StdioBridge } from './stdio';
 import { startUpstream, waitForUpstream } from './supervise';
@@ -11,14 +12,18 @@ const HELP = `lumoauth: put LumoAuth in front of an MCP server
 Usage:
   npx lumoauth secure --upstream <url> [options] [-- <command that starts it>]
   npx lumoauth secure --stdio [options] -- <stdio server command>
+  npx lumoauth ext-authz [options]
   npx lumoauth check [options]
 
 Commands:
-  secure   Serve the MCP server over HTTP behind LumoAuth: OAuth discovery,
-           token checks (Bearer and DPoP) and LumoAuth's per-tool policy.
-           The server's own code does not change.
-  check    Show what LumoAuth's registration says, the discovery document
-           and the 401 challenge, then exit.
+  secure     Serve the MCP server over HTTP behind LumoAuth: OAuth discovery,
+             token checks (Bearer and DPoP) and LumoAuth's per-tool policy.
+             The server's own code does not change.
+  ext-authz  Run as an Envoy HTTP ext_authz check server for Kubernetes / service
+             mesh deployments, returning 200 OK with X-LumoAuth-* headers or
+             401/403 RFC 9728 challenges.
+  check      Show what LumoAuth's registration says, the discovery document
+             and the 401 challenge, then exit.
 
 Options:
   --org <slug>           Organization (LUMOAUTH_ORG_ID)
@@ -28,11 +33,14 @@ Options:
   --issuer <url>         Organization issuer, for a custom domain (LUMOAUTH_ISSUER)
   --upstream <url>       The MCP endpoint to protect, e.g. http://127.0.0.1:8000/mcp
   --stdio                The command after -- is a stdio MCP server
+  --ext-authz            Run in Envoy HTTP ext_authz check mode
   --port <n>             Port to listen on (PORT, default 8080)
   --host <address>       Address to listen on (default 0.0.0.0)
   --path <path>          Public path of the MCP endpoint (default: the Resource URI's path, or /mcp)
   --scope <scope>        A scope every request needs; repeat for more
   --public <path>        Forward this path without a token (health checks); repeatable
+  --jit <tool=type[:a]>  Require a JIT/RAR grant for a tool (e.g. refund=payment:refund); repeatable
+  --vault <slug=conn>    Inject X-LumoAuth-Vault-<Slug>-Token from Token Vault; repeatable
   --tool-policy          Require LumoAuth's per-tool policy (LUMOAUTH_MCP_CLIENT_ID and _SECRET)
   --no-tool-policy       Do not ask LumoAuth about tools
   --no-identity-headers  Do not send X-LumoAuth-* identity headers upstream
@@ -73,7 +81,46 @@ function makeAuth(values: LumoAuthValues): LumoMcpAuth {
 
 const log = (line: string) => console.error(line);
 
-async function secure(args: string[], command: string[]): Promise<void> {
+function parseJitSpecs(specs?: string[]): Record<string, AuthorizationDetail> | undefined {
+    if (!specs || specs.length === 0) return undefined;
+    const out: Record<string, AuthorizationDetail> = {};
+    for (const raw of specs) {
+        const eq = raw.indexOf('=');
+        if (eq <= 0 || eq === raw.length - 1) {
+            throw new UsageError(`--jit must be <tool>=<type>[:action1,action2], got '${raw}'`);
+        }
+        const tool = raw.slice(0, eq).trim();
+        const rest = raw.slice(eq + 1).trim();
+        const [type, actionsRaw] = rest.split(':', 2);
+        if (!tool || !type) throw new UsageError(`--jit must be <tool>=<type>[:action1,action2], got '${raw}'`);
+        const actions = actionsRaw
+            ? actionsRaw
+                  .split(',')
+                  .map((a) => a.trim())
+                  .filter(Boolean)
+            : undefined;
+        out[tool] = actions && actions.length > 0 ? { type, actions } : { type };
+    }
+    return out;
+}
+
+function parseVaultSpecs(specs?: string[]): Record<string, string> | undefined {
+    if (!specs || specs.length === 0) return undefined;
+    const out: Record<string, string> = {};
+    for (const raw of specs) {
+        const eq = raw.indexOf('=');
+        if (eq <= 0 || eq === raw.length - 1) {
+            throw new UsageError(`--vault must be <slug>=<connection_id>, got '${raw}'`);
+        }
+        const slug = raw.slice(0, eq).trim();
+        const conn = raw.slice(eq + 1).trim();
+        if (!slug || !conn) throw new UsageError(`--vault must be <slug>=<connection_id>, got '${raw}'`);
+        out[slug] = conn;
+    }
+    return out;
+}
+
+async function secure(args: string[], command: string[], forceExtAuthz = false): Promise<void> {
     const { values } = parseArgs({
         args,
         strict: true,
@@ -81,26 +128,34 @@ async function secure(args: string[], command: string[]): Promise<void> {
             ...LUMOAUTH_OPTIONS,
             upstream: { type: 'string' },
             stdio: { type: 'boolean' },
+            'ext-authz': { type: 'boolean' },
             port: { type: 'string' },
             host: { type: 'string' },
             path: { type: 'string' },
             public: { type: 'string', multiple: true },
+            jit: { type: 'string', multiple: true },
+            vault: { type: 'string', multiple: true },
             'tool-policy': { type: 'boolean' },
             'no-tool-policy': { type: 'boolean' },
             'no-identity-headers': { type: 'boolean' },
         },
     });
-    if (values.stdio && values.upstream) throw new UsageError('use --upstream or --stdio, not both');
-    if (values.stdio && command.length === 0) {
-        throw new UsageError('--stdio needs the server command after --, for example: lumoauth secure --stdio -- node server.js');
-    }
-    if (!values.stdio && !values.upstream) {
-        throw new UsageError('say which server to protect: --upstream <url> for an HTTP server, or --stdio -- <command>');
-    }
-    if (values.upstream && !/^https?:\/\//.test(values.upstream)) {
-        throw new UsageError(`--upstream must be an http(s) URL, got '${values.upstream}'`);
+    const isExtAuthz = forceExtAuthz || Boolean(values['ext-authz']);
+    if (!isExtAuthz) {
+        if (values.stdio && values.upstream) throw new UsageError('use --upstream or --stdio, not both');
+        if (values.stdio && command.length === 0) {
+            throw new UsageError('--stdio needs the server command after --, for example: lumoauth secure --stdio -- node server.js');
+        }
+        if (!values.stdio && !values.upstream) {
+            throw new UsageError('say which server to protect: --upstream <url> for an HTTP server, or --stdio -- <command>');
+        }
+        if (values.upstream && !/^https?:\/\//.test(values.upstream)) {
+            throw new UsageError(`--upstream must be an http(s) URL, got '${values.upstream}'`);
+        }
     }
 
+    const jit = parseJitSpecs(values.jit);
+    const vaultConnections = parseVaultSpecs(values.vault);
     const auth = makeAuth(values);
     const config = await auth.ready();
     let toolPolicy = auth.hasToolPolicy && !values['no-tool-policy'];
@@ -118,6 +173,36 @@ async function secure(args: string[], command: string[]): Promise<void> {
     const port = Number(values.port ?? process.env.PORT ?? 8080);
     const host = values.host ?? '0.0.0.0';
     if (!Number.isInteger(port) || port < 0 || port > 65535) throw new UsageError(`--port must be a port number, got '${values.port}'`);
+
+    if (isExtAuthz) {
+        const extServer = createExtAuthzServer({
+            auth,
+            toolPolicy,
+            identityHeaders: !values['no-identity-headers'],
+            publicPaths: values.public ?? ['/healthz', '/readyz'],
+            jit,
+            vaultConnections,
+            log,
+        });
+        await new Promise<void>((resolve, reject) => {
+            extServer.once('error', reject);
+            extServer.listen(port, host, resolve);
+        });
+        const addr = extServer.address();
+        const listening = typeof addr === 'object' && addr ? `${host}:${addr.port}` : `${host}:${port}`;
+        log(`lumoauth: Envoy ext_authz server listening on http://${listening}`);
+        log(`  resource       ${config.resource}${config.requireDpop ? '  (DPoP required)' : ''}`);
+        log(`  issuer         ${config.issuer}`);
+        log(`  tool policy    ${toolPolicy ? `on (server ${config.serverId})` : 'off'}`);
+        const stopExt = () => {
+            log('lumoauth: stopping ext-authz');
+            extServer.close();
+            setTimeout(() => process.exit(0), 200).unref();
+        };
+        process.once('SIGINT', stopExt);
+        process.once('SIGTERM', stopExt);
+        return;
+    }
 
     let child: ReturnType<typeof startUpstream> | undefined;
     if (values.upstream && command.length > 0) {
@@ -144,6 +229,8 @@ async function secure(args: string[], command: string[]): Promise<void> {
         toolPolicy,
         identityHeaders: !values['no-identity-headers'],
         publicPaths: values.public ?? [],
+        jit,
+        vaultConnections,
         log,
     });
     await new Promise<void>((resolve, reject) => {
@@ -227,7 +314,9 @@ export async function main(argv: string[]): Promise<void> {
     const [name, ...args] = own;
     switch (name) {
         case 'secure':
-            return secure(args, command);
+            return secure(args, command, false);
+        case 'ext-authz':
+            return secure(args, command, true);
         case 'check':
             return check(args);
         case '-v':

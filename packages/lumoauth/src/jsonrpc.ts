@@ -5,6 +5,8 @@
  * JSON and Server-Sent Events responses.
  */
 
+import type { AuthorizationDetail } from '@lumoauth/mcp';
+
 export type JsonRpcId = string | number | null;
 
 export interface Inspection {
@@ -12,6 +14,8 @@ export interface Inspection {
     toolCalls: Array<{ id: JsonRpcId; name: string }>;
     /** Ids (JSON-encoded) of `tools/list` requests, whose results get filtered. */
     toolListIds: Set<string>;
+    /** W3C `traceparent` found in `params._meta.traceparent`, if any. */
+    traceparent?: string;
     isBatch: boolean;
 }
 
@@ -19,7 +23,7 @@ interface JsonRpcRequestLike {
     jsonrpc?: unknown;
     id?: unknown;
     method?: unknown;
-    params?: { name?: unknown } | unknown;
+    params?: { name?: unknown; _meta?: { traceparent?: unknown } } | unknown;
 }
 
 function asId(value: unknown): JsonRpcId {
@@ -38,9 +42,13 @@ export function inspect(body: string): Inspection {
     result.isBatch = Array.isArray(parsed);
     const messages = (Array.isArray(parsed) ? parsed : [parsed]) as JsonRpcRequestLike[];
     for (const message of messages) {
-        if (typeof message !== 'object' || message === null || message.id === undefined) continue;
+        if (typeof message !== 'object' || message === null) continue;
+        const params = message.params as { name?: unknown; _meta?: { traceparent?: unknown } } | undefined;
+        if (!result.traceparent && typeof params?._meta?.traceparent === 'string') {
+            result.traceparent = params._meta.traceparent;
+        }
+        if (message.id === undefined) continue;
         if (message.method === 'tools/call') {
-            const params = message.params as { name?: unknown } | undefined;
             result.toolCalls.push({ id: asId(message.id), name: typeof params?.name === 'string' ? params.name : '' });
         } else if (message.method === 'tools/list') {
             result.toolListIds.add(JSON.stringify(message.id));
@@ -52,6 +60,34 @@ export function inspect(body: string): Inspection {
 /** A refused `tools/call`: an error result the model can read. */
 export function refusedToolResult(id: JsonRpcId, message: string): Record<string, unknown> {
     return { jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: message }], isError: true } };
+}
+
+/** A refused `tools/call` due to missing JIT / RFC 9396 `authorization_details`. */
+export function refusedJitToolResult(
+    id: JsonRpcId,
+    tool: string,
+    requiredDetails: AuthorizationDetail[],
+): { body: Record<string, unknown>; headerValue: string } {
+    const hintJson = JSON.stringify(requiredDetails);
+    const headerValue = Buffer.from(hintJson, 'utf8').toString('base64');
+    const types = requiredDetails.map((d) => d.type).join(', ');
+    const message = `Tool '${tool}' requires JIT authorization_details (${types}); authorization_details_hint=${hintJson}`;
+    return {
+        headerValue,
+        body: {
+            jsonrpc: '2.0',
+            id,
+            result: {
+                content: [{ type: 'text', text: message }],
+                isError: true,
+                _meta: {
+                    error: 'insufficient_authorization_details',
+                    authorization_details_hint: requiredDetails,
+                    'Insufficient-Authorization-Details': headerValue,
+                },
+            },
+        },
+    };
 }
 
 type Decide = (toolNames: string[]) => Promise<Set<string>>;

@@ -9,7 +9,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { DpopProofSigner } from '@lumoauth/agent';
 import { lumoAuth } from '@lumoauth/mcp';
-import { StdioBridge, allowedToolNames, createSecureProxy } from '../dist/index.mjs';
+import { StdioBridge, allowedToolNames, createExtAuthzServer, createSecureProxy } from '../dist/index.mjs';
 import { ISSUER, METADATA_URL, RESOURCE, SERVER_ID, fakeLumoAuth, initialize, makeToken } from '../../mcp/tests/helpers.mjs';
 
 const HEADERS = { 'content-type': 'application/json', accept: 'application/json, text/event-stream' };
@@ -275,5 +275,148 @@ describe('secure --stdio', () => {
     test('requests without a session must initialize first', async () => {
         const response = await post(listTools, { authorization: alice });
         assert.equal(response.status, 400);
+    });
+});
+
+describe('JIT, Vault header injection, traceparent & Envoy ext_authz mode', () => {
+    const fake = fakeLumoAuth({ allowedTools: new Set(['whoami']) });
+    let upstream;
+    let proxy;
+    let proxyBase;
+    let extAuthz;
+    let extBase;
+
+    before(async () => {
+        upstream = await startUpstream({ json: true });
+        const auth = makeAuth(fake);
+        proxy = createSecureProxy({
+            auth,
+            upstream: upstream.url,
+            path: '/mcp',
+            toolPolicy: true,
+            identityHeaders: true,
+            publicPaths: ['/health'],
+            jit: { whoami: { type: 'identity_inspection', actions: ['read'] } },
+            vaultConnections: { github: 'conn_gh_prod' },
+            log: () => {},
+        });
+        proxyBase = await listen(proxy);
+
+        extAuthz = createExtAuthzServer({
+            auth,
+            toolPolicy: true,
+            identityHeaders: true,
+            publicPaths: ['/healthz'],
+            jit: { whoami: { type: 'identity_inspection', actions: ['read'] } },
+            vaultConnections: { github: 'conn_gh_prod' },
+            log: () => {},
+        });
+        extBase = await listen(extAuthz);
+    });
+
+    after(() => {
+        proxy.close();
+        extAuthz.close();
+        upstream.close();
+    });
+
+    test('proxy enforces JIT on tools/call and injects Vault token + trace headers upstream when granted', async () => {
+        const tp = '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01';
+        const plainToken = makeToken({ sub: 'alice' });
+
+        // 1. Denied without JIT details
+        const deniedRes = await fetch(`${proxyBase}/mcp`, {
+            method: 'POST',
+            headers: { ...HEADERS, 'mcp-protocol-version': '2025-11-25', authorization: `Bearer ${plainToken}` },
+            body: JSON.stringify(callTool('whoami')),
+        });
+        assert.equal(deniedRes.status, 200);
+        assert.ok(deniedRes.headers.get('insufficient-authorization-details'));
+        const deniedBody = await rpcBody(deniedRes);
+        assert.equal(deniedBody.result.isError, true);
+        assert.equal(deniedBody.result._meta.error, 'insufficient_authorization_details');
+
+        // 2. Allowed with JIT details: injects X-LumoAuth-Vault-Github-Token, X-LumoAuth-Trace-Id, X-LumoAuth-Is-Jit
+        const jitToken = makeToken({
+            sub: 'alice',
+            jit: true,
+            authorization_details: [{ type: 'identity_inspection', actions: ['read'] }],
+        });
+        const okRes = await fetch(`${proxyBase}/mcp`, {
+            method: 'POST',
+            headers: {
+                ...HEADERS,
+                'mcp-protocol-version': '2025-11-25',
+                authorization: `Bearer ${jitToken}`,
+                traceparent: tp,
+            },
+            body: JSON.stringify(callTool('whoami')),
+        });
+        assert.equal(okRes.status, 200);
+        const lastUpstream = upstream.seen.at(-1).headers;
+        assert.equal(lastUpstream['x-lumoauth-subject'], 'alice');
+        assert.equal(lastUpstream['x-lumoauth-trace-id'], '4bf92f3577b34da6a3ce929d0e0e4736');
+        assert.equal(lastUpstream['x-lumoauth-is-jit'], 'true');
+        assert.match(lastUpstream['x-lumoauth-vault-github-token'], /^vault_tok_conn_gh_prod_/);
+        assert.equal(lastUpstream.traceparent, tp);
+    });
+
+    test('Envoy ext_authz server handles health, discovery, 401 challenge, toolPolicy, JIT, and upstream headers', async () => {
+        // 1. Public health check
+        assert.equal((await fetch(`${extBase}/healthz`)).status, 200);
+
+        // 2. Discovery document
+        const disc = await fetch(`${extBase}/.well-known/oauth-protected-resource/mcp`);
+        assert.equal(disc.status, 200);
+        assert.equal((await disc.json()).resource, RESOURCE);
+
+        // 3. Unauthenticated -> 401 challenge
+        const unauth = await fetch(`${extBase}/mcp`, { method: 'POST' });
+        assert.equal(unauth.status, 401);
+        assert.match(unauth.headers.get('www-authenticate'), /resource_metadata=/);
+
+        // 4. Denied by ToolPolicy -> 403 with X-LumoAuth-Denied-Tool
+        const plainToken = makeToken({ sub: 'alice' });
+        const deniedPolicy = await fetch(`${extBase}/mcp`, {
+            method: 'POST',
+            headers: { ...HEADERS, authorization: `Bearer ${plainToken}` },
+            body: JSON.stringify(callTool('export')),
+        });
+        assert.equal(deniedPolicy.status, 403);
+        assert.equal(deniedPolicy.headers.get('x-lumoauth-denied-tool'), 'export');
+
+        // 5. Denied by JIT -> 403 with Insufficient-Authorization-Details
+        const deniedJit = await fetch(`${extBase}/mcp`, {
+            method: 'POST',
+            headers: { ...HEADERS, authorization: `Bearer ${plainToken}` },
+            body: JSON.stringify(callTool('whoami')),
+        });
+        assert.equal(deniedJit.status, 403);
+        assert.ok(deniedJit.headers.get('insufficient-authorization-details'));
+        assert.match(deniedJit.headers.get('www-authenticate'), /insufficient_authorization_details/);
+
+        // 6. Allowed -> 200 OK with X-LumoAuth-* and Vault headers for Envoy upstream injection
+        const tp = '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01';
+        const jitToken = makeToken({
+            sub: 'alice',
+            jit: true,
+            authorization_details: [{ type: 'identity_inspection', actions: ['read'] }],
+        });
+        const allowed = await fetch(`${extBase}/mcp`, {
+            method: 'POST',
+            headers: {
+                ...HEADERS,
+                authorization: `Bearer ${jitToken}`,
+                traceparent: tp,
+                'x-envoy-original-path': '/mcp',
+            },
+            body: JSON.stringify(callTool('whoami')),
+        });
+        assert.equal(allowed.status, 200);
+        assert.equal(allowed.headers.get('x-lumoauth-subject'), 'alice');
+        assert.equal(allowed.headers.get('x-lumoauth-trace-id'), '4bf92f3577b34da6a3ce929d0e0e4736');
+        assert.equal(allowed.headers.get('x-lumoauth-is-jit'), 'true');
+        assert.match(allowed.headers.get('x-lumoauth-vault-github-token'), /^vault_tok_conn_gh_prod_/);
+        assert.equal(allowed.headers.get('traceparent'), tp);
     });
 });

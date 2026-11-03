@@ -18,14 +18,33 @@ import { matchingAudiences, originOf, protectedResourceMetadataUrl, sameResource
 import { missingScopes, scopeCovered } from './scopes';
 import {
     ToolPolicy,
+    VaultClient,
     guardHandler,
     lumoScopeChallenge,
     secureServerTools,
+    type AuthorizationDetail,
     type GuardOptions,
     type SecureToolsOptions,
+    type VaultToken,
+    type VaultTokenOptions,
 } from './tools';
 
 export { LumoAuthChallenge, type SimpleResponse };
+
+const TRACEPARENT_RE = /^00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$/;
+const ZERO_TRACE_ID = '00000000000000000000000000000000';
+const ZERO_SPAN_ID = '0000000000000000';
+
+/** Validate a W3C `traceparent` header and extract the 32-hex `traceId`. */
+export function parseTraceparent(value?: string | null): { traceparent: string; traceId: string } | undefined {
+    if (!value || typeof value !== 'string') return undefined;
+    const normalized = value.trim().toLowerCase();
+    const match = TRACEPARENT_RE.exec(normalized);
+    if (!match) return undefined;
+    const [, traceId, spanId] = match;
+    if (traceId === ZERO_TRACE_ID || spanId === ZERO_SPAN_ID) return undefined;
+    return { traceparent: normalized, traceId };
+}
 
 /**
  * LumoAuth as the authorization server of an MCP server.
@@ -79,6 +98,10 @@ export interface LumoMcpAuthOptions {
     clientId?: string;
     /** Env: `LUMOAUTH_MCP_CLIENT_SECRET`. */
     clientSecret?: string;
+    /** Agent bearer token for Token Vault access (`LUMOAUTH_AGENT_TOKEN`). */
+    agentToken?: string;
+    /** Seconds to cache a Token Vault access token. Default 60; 0 disables. */
+    vaultTokenTtl?: number;
     /** The registration to use instead of fetching it (tests, offline). */
     registration?: Registration | Record<string, unknown>;
     /** Custom fetch for the registration, discovery, JWKS and policy calls. */
@@ -119,6 +142,14 @@ export interface LumoCaller {
     capabilities: string[];
     /** `cnf.jkt` of a DPoP-bound token. */
     dpopJkt?: string;
+    /** `true` when the caller holds a JIT token or RFC 9396 `authorization_details`. */
+    isJit: boolean;
+    /** RFC 9396 Rich Authorization Requests details granted to this caller. */
+    authorizationDetails: AuthorizationDetail[];
+    /** Validated W3C `traceparent` header from the request, if present. */
+    traceparent?: string;
+    /** 32-hex W3C trace ID extracted from `traceparent` or token claims. */
+    traceId?: string;
     claims: AccessTokenClaims;
 }
 
@@ -195,7 +226,32 @@ function canonicalScheme(scheme: string): 'Bearer' | 'DPoP' | undefined {
     return lower === 'bearer' ? 'Bearer' : lower === 'dpop' ? 'DPoP' : undefined;
 }
 
-function toCaller(claims: AccessTokenClaims, scopes: string[]): LumoCaller {
+function extractAuthorizationDetails(claims: AccessTokenClaims): AuthorizationDetail[] {
+    const raw = claims as Record<string, unknown>;
+    const items: AuthorizationDetail[] = [];
+    if (Array.isArray(raw.authorization_details)) {
+        for (const item of raw.authorization_details) {
+            if (typeof item === 'object' && item !== null && typeof (item as { type?: unknown }).type === 'string') {
+                items.push(item as AuthorizationDetail);
+            }
+        }
+    }
+    const perms = raw.permissions;
+    if (typeof perms === 'object' && perms !== null && Array.isArray((perms as { authorization_details?: unknown }).authorization_details)) {
+        for (const item of (perms as { authorization_details: unknown[] }).authorization_details) {
+            if (typeof item === 'object' && item !== null && typeof (item as { type?: unknown }).type === 'string') {
+                items.push(item as AuthorizationDetail);
+            }
+        }
+    }
+    return items;
+}
+
+function toCaller(
+    claims: AccessTokenClaims,
+    scopes: string[],
+    extra?: { traceparent?: string; traceId?: string; jitDetails?: AuthorizationDetail[]; isJit?: boolean },
+): LumoCaller {
     const isAgent = claims.is_agent === true;
     const actChain: ActorClaim[] = [];
     let current: ActorClaim | undefined = typeof claims.act === 'object' && claims.act !== null ? claims.act : undefined;
@@ -204,6 +260,20 @@ function toCaller(claims: AccessTokenClaims, scopes: string[]): LumoCaller {
         actChain.push(actor as ActorClaim);
         current = typeof act === 'object' && act !== null ? act : undefined;
     }
+    const raw = claims as Record<string, unknown>;
+    const details = [...extractAuthorizationDetails(claims), ...(extra?.jitDetails ?? [])];
+    const perms = typeof raw.permissions === 'object' && raw.permissions !== null ? (raw.permissions as Record<string, unknown>) : undefined;
+    const isJit =
+        Boolean(extra?.isJit) ||
+        raw.jit === true ||
+        typeof perms?.jit_request_id === 'string' ||
+        details.length > 0;
+    const claimTraceId =
+        typeof raw.trace_id === 'string'
+            ? raw.trace_id
+            : typeof (actChain[0] as Record<string, unknown> | undefined)?.trace_id === 'string'
+              ? ((actChain[0] as Record<string, unknown>).trace_id as string)
+              : undefined;
     return {
         sub: claims.sub,
         issuer: claims.iss,
@@ -218,6 +288,10 @@ function toCaller(claims: AccessTokenClaims, scopes: string[]): LumoCaller {
             ? claims.capabilities.filter((c): c is string => typeof c === 'string')
             : [],
         dpopJkt: typeof claims.cnf?.jkt === 'string' ? claims.cnf.jkt : undefined,
+        isJit,
+        authorizationDetails: details,
+        traceparent: extra?.traceparent,
+        traceId: extra?.traceId ?? claimTraceId,
         claims,
     };
 }
@@ -229,6 +303,7 @@ export class LumoMcpAuth {
     readonly lumoauthUrl: string;
     readonly clientId: string | undefined;
     readonly clientSecret: string | undefined;
+    readonly agentToken: string | undefined;
 
     private readonly options: LumoMcpAuthOptions;
     private readonly env: Record<string, string | undefined>;
@@ -238,6 +313,7 @@ export class LumoMcpAuth {
     private configPromise: Promise<ResolvedConfig> | undefined;
     private asMetadata: { at: number; document: unknown } | undefined;
     private policy: ToolPolicy | undefined;
+    private vaultClient: VaultClient | undefined;
 
     constructor(options: LumoMcpAuthOptions = {}) {
         this.options = options;
@@ -261,6 +337,7 @@ export class LumoMcpAuth {
         }
         this.clientId = options.clientId ?? (env.LUMOAUTH_MCP_CLIENT_ID || undefined);
         this.clientSecret = options.clientSecret ?? (env.LUMOAUTH_MCP_CLIENT_SECRET || undefined);
+        this.agentToken = options.agentToken ?? (env.LUMOAUTH_AGENT_TOKEN || undefined);
         this.fetchFn = options.fetch ?? globalThis.fetch.bind(globalThis);
         this.jwksCache = new JwksCache(this.fetchFn);
         this.replayCache = options.replayCache ?? new InMemoryDpopReplayCache();
@@ -314,6 +391,21 @@ export class LumoMcpAuth {
     /** An SDK v2 `scopeChallenge` that honours LumoAuth wildcards. */
     scopeChallenge(...scopes: [string, ...string[]]) {
         return lumoScopeChallenge(...scopes);
+    }
+
+    /** LumoAuth Token Vault client for this server. */
+    vault(): VaultClient {
+        this.vaultClient ??= new VaultClient(this, this.fetchFn, { cacheTtl: this.options.vaultTokenTtl });
+        return this.vaultClient;
+    }
+
+    /**
+     * Fetch a short-lived outbound OAuth token from LumoAuth's Token Vault.
+     * Pass SDK v1 `extra`, SDK v2 `ctx`, a `LumoCaller`, or `{ userId, caller, traceparent }`.
+     * When the caller is a human user or user-delegated agent, `user_id` defaults to `caller.sub`.
+     */
+    vaultToken(connectionId: string, extraOrCtxOrOptions?: VaultTokenOptions | unknown): Promise<VaultToken> {
+        return this.vault().getToken(connectionId, extraOrCtxOrOptions);
     }
 
     // ── Configuration ─────────────────────────────────────────────────
@@ -456,6 +548,34 @@ export class LumoMcpAuth {
             ...granted,
             ...config.requiredScopes.filter((s) => !granted.includes(s) && scopeCovered(s, granted)),
         ];
+        const tp = parseTraceparent(headerValue(request.headers, 'traceparent'));
+        let jitDetails: AuthorizationDetail[] | undefined;
+        let isJit = false;
+        const jitHeader = headerValue(request.headers, 'x-lumoauth-jit-token')?.trim();
+        if (jitHeader) {
+            try {
+                const jitUnverified = decodePayload(jitHeader);
+                const resMatch = matchingAudiences(jitUnverified?.aud, config.resource)[0];
+                const issMatch = matchingAudiences(jitUnverified?.aud, config.issuer)[0];
+                const jitAud = resMatch ?? issMatch ?? config.resource;
+                const jitClaims = await verifyAccessToken(jitHeader, {
+                    issuer: config.issuer,
+                    resource: jitAud,
+                    fetch: this.fetchFn,
+                    clockSkew: this.options.clockSkew,
+                    requireDpop: false,
+                    jwksCache: this.jwksCache,
+                    replayCache: this.replayCache,
+                });
+                const actorSub = typeof claims.act === 'object' && claims.act !== null ? claims.act.sub : undefined;
+                if (jitClaims.sub === claims.sub || (actorSub && jitClaims.sub === actorSub)) {
+                    jitDetails = extractAuthorizationDetails(jitClaims);
+                    isJit = true;
+                }
+            } catch {
+                // Ignore invalid accompanying JIT header; tool-level JIT guard will challenge if needed.
+            }
+        }
         return {
             token,
             clientId: claims.client_id ?? claims.sub,
@@ -463,7 +583,14 @@ export class LumoMcpAuth {
             expiresAt: claims.exp,
             resource: new URL(config.resource),
             resourceMetadataUrl: config.resourceMetadataUrl,
-            extra: { caller: toCaller(claims, scopes) },
+            extra: {
+                caller: toCaller(claims, scopes, {
+                    traceparent: tp?.traceparent,
+                    traceId: tp?.traceId,
+                    jitDetails,
+                    isJit,
+                }),
+            },
         };
     }
 
