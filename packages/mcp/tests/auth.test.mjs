@@ -208,6 +208,9 @@ test('scope, capability and resource helpers', () => {
     assert.equal(scopeCovered('files:read', [':*']), false);
     assert.equal(capabilityCovered('users:delete', ['Users-*']), true);
     assert.equal(capabilityCovered('users', ['users.*']), false);
+    // The server lower-cases ASCII letters only.
+    assert.equal(capabilityCovered('Ünits.Read', ['Ünits.read']), true);
+    assert.equal(capabilityCovered('Ünits.Read', ['ünits.read']), false);
     assert.equal(normalizeResource('HTTPS://MCP.Example.com:443/mcp/'), 'https://mcp.example.com/mcp');
     assert.equal(protectedResourceMetadataUrl('https://x.example.com'), 'https://x.example.com/.well-known/oauth-protected-resource');
 });

@@ -56,7 +56,7 @@ export {
     protectedResourceMetadataUrl,
     sameResource,
 } from './resource';
-export { capabilityCovered, missingScopes, scopeCovered } from './scopes';
+export { capabilityCovered, missingScopes, normalizeCapability, scopeCovered } from './scopes';
 export {
     InsufficientAuthorizationDetailsError,
     MCP_AUTHORIZE_SCOPE,
