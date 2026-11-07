@@ -5,7 +5,7 @@ import { allowedToolNames, createSecureProxy } from './proxy';
 import { StdioBridge } from './stdio';
 import { startUpstream, waitForUpstream } from './supervise';
 
-const VERSION = '1.3.0';
+const VERSION = '1.3.1';
 
 const HELP = `lumoauth: put LumoAuth in front of an MCP server
 
