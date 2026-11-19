@@ -110,11 +110,11 @@ test('a valid token gives the caller', async () => {
 });
 
 test('agent tokens', async () => {
-    const token = makeToken({ sub: 'agent_agt_42', is_agent: true, client_id: 'agt_42', capabilities: ['billing.*'] });
+    const token = makeToken({ sub: 'agent_agt_42', is_agent: true, client_id: 'agt_42', capabilities: ['billing:*'] });
     const { caller } = (await makeAuth().authenticate(request({ authorization: `Bearer ${token}` }))).extra;
     assert.equal(caller.isAgent, true);
     assert.equal(caller.agentId, 'agt_42');
-    assert.deepEqual(caller.capabilities, ['billing.*']);
+    assert.deepEqual(caller.capabilities, ['billing:*']);
 });
 
 for (const [name, claims, reason] of [
@@ -206,11 +206,16 @@ test('scope, capability and resource helpers', () => {
     assert.equal(scopeCovered('invoices.refund', ['invoices.*']), false);
     assert.equal(scopeCovered('invoices.*', ['invoices.*']), true);
     assert.equal(scopeCovered('files:read', [':*']), false);
-    assert.equal(capabilityCovered('users:delete', ['Users-*']), true);
-    assert.equal(capabilityCovered('users', ['users.*']), false);
+    assert.equal(capabilityCovered('users:delete', ['Users:*']), true);
+    // A '.' still reads as ':'.
+    assert.equal(capabilityCovered('users.delete', ['Users.*']), true);
+    // A '-' is part of a name, not a separator.
+    assert.equal(capabilityCovered('users:delete', ['Users-*']), false);
+    assert.equal(capabilityCovered('users-archive:read', ['users:*']), false);
+    assert.equal(capabilityCovered('users', ['users:*']), false);
     // The server lower-cases ASCII letters only.
-    assert.equal(capabilityCovered('Ünits.Read', ['Ünits.read']), true);
-    assert.equal(capabilityCovered('Ünits.Read', ['ünits.read']), false);
+    assert.equal(capabilityCovered('Ünits:Read', ['Ünits:read']), true);
+    assert.equal(capabilityCovered('Ünits:Read', ['ünits:read']), false);
     assert.equal(normalizeResource('HTTPS://MCP.Example.com:443/mcp/'), 'https://mcp.example.com/mcp');
     assert.equal(protectedResourceMetadataUrl('https://x.example.com'), 'https://x.example.com/.well-known/oauth-protected-resource');
 });

@@ -31,26 +31,32 @@ export function missingScopes(required: readonly string[], granted: readonly str
 const CAPABILITY_TRIM = /^[ \t\n\r\0\x0B]+|[ \t\n\r\0\x0B]+$/g;
 
 /**
- * A capability in the form that the server stores: trimmed, ASCII letters in
- * lower case, `:` and `-` turned into `.`, runs of `.` collapsed, `.` trimmed
- * from both ends. `'Invoices:Read'` and `'invoices-read'` both become
- * `'invoices.read'`. Only ASCII letters are lower-cased, as on the server, so
- * `'Ünits.Read'` becomes `'Ünits.read'`.
+ * A capability in the canonical form that the server compares,
+ * `<resource>:<action>`: trimmed, ASCII letters in lower case, `.` turned
+ * into `:`, runs of `:` collapsed, `:` trimmed from both ends.
+ * `'Invoices.Read'` and
+ * `'invoices:read'` both become `'invoices:read'`. A `-` is part of a name
+ * (`'clients:rotate-secret'`), so `'invoices-read'` stays as it is. Only
+ * ASCII letters are lower-cased, as on the server, so `'Ünits:Read'` becomes
+ * `'Ünits:read'`.
  */
 export function normalizeCapability(capability: string): string {
     return capability
         .replace(CAPABILITY_TRIM, '')
         .replace(/[A-Z]/g, (letter) => letter.toLowerCase())
-        .replace(/[:-]/g, '.')
-        .replace(/\.{2,}/g, '.')
-        .replace(/^\.+|\.+$/g, '');
+        .replace(/\./g, ':')
+        .replace(/:{2,}/g, ':')
+        .replace(/^:+|:+$/g, '');
 }
 
 /**
  * LumoAuth's agent capability match (`AgentCapability::covers`), in the
- * stored form of {@link normalizeCapability}: `*` covers everything, and
- * `users.*` covers `users.delete` but not `users`. Entries of `granted` that
- * are not strings are ignored.
+ * canonical form of {@link normalizeCapability}: `*` covers everything, and
+ * `users:*` covers `users:delete` and `users:delete:hard` but not `users` or
+ * `users-archive:read`. A `.` reads as `:` only when comparing, so a dotted
+ * name such as `users.delete` (a permission slug) matches too. LumoAuth
+ * itself refuses the dot form when a capability is registered. Entries of
+ * `granted` that are not strings are ignored.
  */
 export function capabilityCovered(required: string, granted: readonly string[]): boolean {
     const wanted = normalizeCapability(required);
@@ -60,6 +66,6 @@ export function capabilityCovered(required: string, granted: readonly string[]):
         const have = normalizeCapability(capability);
         if (have === '') return false;
         if (have === '*' || have === wanted) return true;
-        return have.endsWith('.*') && wanted.startsWith(have.slice(0, -1));
+        return have.endsWith(':*') && wanted.startsWith(have.slice(0, -1));
     });
 }

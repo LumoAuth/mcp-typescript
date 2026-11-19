@@ -244,7 +244,7 @@ server.registerTool('change_bank_details', { inputSchema: { iban: z.string() } }
 The options:
 
 - `scopes`: the scopes that the tool needs. As in LumoAuth, a granted scope that ends in `:*` (such as `invoices:*`) covers the scopes under it, and every other scope compares exactly. Prefer narrow scopes, because the MCP security best practices list wildcard scopes as a common mistake.
-- `agents: true` or `agents: ['billing.reminders']`: AI agents only, with these capabilities.
+- `agents: true` or `agents: ['reminders:send']`: AI agents only, with these capabilities. A capability reads `<resource>:<action>`, and an agent that holds `reminders:*` has `reminders:send` too.
 - `users: true`: people only. `users: 'delegated'` also admits an agent that acts for a person.
 - `jit`: require a Just-in-Time (RFC 9396 `authorization_details`) grant for the tool. See [Step-up approval for sensitive tools (JIT)](#step-up-approval-for-sensitive-tools-jit).
 - `policy`: ask LumoAuth's per-tool policy. This is on by default when the server's client credentials are set, as described below.
